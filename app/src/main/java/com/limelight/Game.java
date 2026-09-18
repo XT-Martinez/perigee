@@ -55,6 +55,7 @@ import com.limelight.utils.SpinnerDialog;
 import com.limelight.utils.FSRSizerInstaller;
 import com.limelight.utils.UiHelper;
 import com.limelight.utils.WifiDirectLatencyFix;
+import com.limelight.utils.WifiHalLatency;
 
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
@@ -690,6 +691,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             // WifiLock.acquire() even though we have android.permission.WAKE_LOCK in our manifest.
             e.printStackTrace();
         }
+
+        // Best-effort attempt to force the Wi-Fi chip into low-latency mode. The Android
+        // Wi-Fi stack skips this when the chip does not advertise support, so try the HAL
+        // directly and log the result (SELinux may refuse; that is fine).
+        WifiHalLatency.requestLowLatency();
 
         appName = Game.this.getIntent().getStringExtra(EXTRA_APP_NAME);
         pcName = Game.this.getIntent().getStringExtra(EXTRA_PC_NAME);
