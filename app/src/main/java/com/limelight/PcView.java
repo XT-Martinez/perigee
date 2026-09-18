@@ -28,6 +28,7 @@ import com.limelight.utils.Dialog;
 import com.limelight.utils.HelpLauncher;
 import com.limelight.utils.ServerHelper;
 import com.limelight.utils.ShortcutHelper;
+import com.limelight.utils.TclGameModeProfile;
 import com.limelight.utils.UiHelper;
 
 import android.app.ActivityManager;
@@ -393,6 +394,10 @@ public class PcView extends AppCompatActivity implements AdapterFragmentCallback
     @Override
     protected void onResume() {
         super.onResume();
+
+        // If the app was killed while a stream had the TV's Game mode applied, put the
+        // pre-stream settings back now. No-op while a stream is live or nothing to restore.
+        TclGameModeProfile.restoreIfIdle(getApplicationContext());
 
         // Display a decoder crash notification if we've returned after a crash
         UiHelper.showDecoderCrashDialog(this);

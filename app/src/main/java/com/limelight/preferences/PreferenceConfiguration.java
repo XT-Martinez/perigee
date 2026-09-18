@@ -402,6 +402,9 @@ public class PreferenceConfiguration {
 
     // TCL/MediaTek Wi-Fi Direct latency workaround (see WifiDirectLatencyFix)
     public boolean wifiDirectLatencyFix;
+
+    // TCL/MediaTek Game picture/audio mode for the duration of a stream (see TclGameModeProfile)
+    public boolean tclGameModeProfile;
     // Vsync settings
     public boolean enableVsync = false;
 
@@ -1124,6 +1127,7 @@ public class PreferenceConfiguration {
 
         // Keep the code default in sync with preferences.xml
         config.wifiDirectLatencyFix=prefs.getBoolean("checkbox_wifi_direct_latency_fix",true);
+        config.tclGameModeProfile=prefs.getBoolean("checkbox_tcl_game_mode_profile",true);
 
         config.alignDisplayTopCenter =prefs.getBoolean("checkbox_enable_view_top_center",false);
 

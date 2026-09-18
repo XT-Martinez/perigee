@@ -54,6 +54,7 @@ import com.limelight.utils.ShortcutHelper;
 import com.limelight.utils.SpinnerDialog;
 import com.limelight.utils.FSRSizerInstaller;
 import com.limelight.utils.UiHelper;
+import com.limelight.utils.TclGameModeProfile;
 import com.limelight.utils.WifiDirectLatencyFix;
 import com.limelight.utils.WifiHalLatency;
 
@@ -469,6 +470,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         // is associated with periodic streaming stalls. Stop it once at stream startup.
         if (prefConfig.wifiDirectLatencyFix) {
             WifiDirectLatencyFix.stopAtStreamStart(this);
+        }
+
+        // TCL/MediaTek picture pipeline: switch the TV to its Game mode for the duration
+        // of the stream. onDestroy() puts the pre-stream settings back.
+        if (prefConfig.tclGameModeProfile) {
+            TclGameModeProfile.onStreamStart(getApplicationContext());
         }
 
         if (prefConfig.fullScreen) {
@@ -1894,6 +1901,10 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             compositorHeartbeat.stop();
         }
         timerHandler.removeCallbacksAndMessages(null);
+
+        // Put the TV's pre-stream picture/audio settings back once the last live stream
+        // activity is gone. Safe even after a crash, and a no-op when nothing was changed.
+        TclGameModeProfile.onStreamEnd(getApplicationContext());
 
         if (prefConfig.enableFullExDisplay) handleDisplayRemoved();
 
