@@ -37,6 +37,7 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.net.Uri;
 import android.opengl.GLSurfaceView;
@@ -46,6 +47,7 @@ import android.os.IBinder;
 import android.provider.Settings;
 import android.text.InputFilter;
 import android.text.InputType;
+import android.Manifest;
 import android.view.ContextMenu;
 import android.view.Menu;
 import android.view.MenuItem;
@@ -63,6 +65,8 @@ import android.widget.Toast;
 import android.widget.AdapterView.AdapterContextMenuInfo;
 
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 import androidx.preference.PreferenceManager;
 
 import org.xmlpull.v1.XmlPullParserException;
@@ -136,6 +140,21 @@ public class PcView extends AppCompatActivity implements AdapterFragmentCallback
     private final static int GAMESTREAM_EOL_ID = 11;
     private final static int OPEN_MANAGEMENT_PAGE_ID = 20;
     private final static int PAIR_ID_OTP = 21;
+    private final static int WIFI_DIRECT_PERMISSION_REQUEST_CODE = 1002;
+
+    private void maybeRequestWifiDirectPermission(PreferenceConfiguration config) {
+        // The optional TCL/MediaTek workaround stops background Wi-Fi Direct listening,
+        // which requires nearby-devices access on Android 13+. Ask on the PC list rather
+        // than during a stream.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && config.wifiDirectLatencyFix
+                && ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES)
+                    != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[] { Manifest.permission.NEARBY_WIFI_DEVICES },
+                    WIFI_DIRECT_PERMISSION_REQUEST_CODE);
+        }
+    }
 
     private void initializeViews() {
         setContentView(R.layout.activity_pc_view);
@@ -150,8 +169,12 @@ public class PcView extends AppCompatActivity implements AdapterFragmentCallback
         // Set default preferences if we've never been run
         PreferenceManager.setDefaultValues(this, R.xml.preferences, false);
 
+        PreferenceConfiguration config = PreferenceConfiguration.readPreferences(this);
+
         // Set the correct layout for the PC grid
-        pcGridAdapter.updateLayoutWithPreferences(this, PreferenceConfiguration.readPreferences(this));
+        pcGridAdapter.updateLayoutWithPreferences(this, config);
+
+        maybeRequestWifiDirectPermission(config);
 
         // Setup the list view
         ImageButton settingsButton = findViewById(R.id.settingsButton);

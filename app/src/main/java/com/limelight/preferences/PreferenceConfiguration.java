@@ -399,6 +399,9 @@ public class PreferenceConfiguration {
     public boolean enableNewAnalogStick;
 
     public boolean enableFullExDisplay;
+
+    // TCL/MediaTek Wi-Fi Direct latency workaround (see WifiDirectLatencyFix)
+    public boolean wifiDirectLatencyFix;
     // Vsync settings
     public boolean enableVsync = false;
 
@@ -1118,6 +1121,9 @@ public class PreferenceConfiguration {
         config.enableNewAnalogStick=prefs.getBoolean(CHECKBOX_CHECKBOX_ENABLE_ANALOG_STICK_NEW,false);
 
         config.enableFullExDisplay=prefs.getBoolean("checkbox_enable_fullexdisplay",false);
+
+        // Keep the code default in sync with preferences.xml
+        config.wifiDirectLatencyFix=prefs.getBoolean("checkbox_wifi_direct_latency_fix",true);
 
         config.alignDisplayTopCenter =prefs.getBoolean("checkbox_enable_view_top_center",false);
 

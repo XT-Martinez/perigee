@@ -221,6 +221,13 @@
         app:iconSpaceReserved="false">
 
         <CheckBoxPreference
+            android:defaultValue="true"
+            android:key="checkbox_wifi_direct_latency_fix"
+            android:summary="@string/summary_checkbox_wifi_direct_latency_fix"
+            android:title="@string/title_checkbox_wifi_direct_latency_fix"
+            app:iconSpaceReserved="false" />
+
+        <CheckBoxPreference
             android:defaultValue="false"
             android:key="checkbox_ultra_low_latency"
             android:summary="@string/summary_checkbox_ultra_low_latency"

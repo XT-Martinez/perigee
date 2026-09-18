@@ -54,6 +54,7 @@ import com.limelight.utils.ShortcutHelper;
 import com.limelight.utils.SpinnerDialog;
 import com.limelight.utils.FSRSizerInstaller;
 import com.limelight.utils.UiHelper;
+import com.limelight.utils.WifiDirectLatencyFix;
 
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
@@ -462,6 +463,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         // Read the stream preferences
         prefConfig = PreferenceConfiguration.readPreferences(this);
         tombstonePrefs = Game.this.getSharedPreferences("DecoderTombstone", 0);
+
+        // TCL/MediaTek 5 GHz workaround: background Wi-Fi Direct listening periodically
+        // is associated with periodic streaming stalls. Stop it once at stream startup.
+        if (prefConfig.wifiDirectLatencyFix) {
+            WifiDirectLatencyFix.stopAtStreamStart(this);
+        }
 
         if (prefConfig.fullScreen) {
             // Full-screen
