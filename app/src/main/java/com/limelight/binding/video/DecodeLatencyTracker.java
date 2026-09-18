@@ -30,19 +30,25 @@ public final class DecodeLatencyTracker {
         enqueueNsByPtsUs.put(ptsUs, enqueueNs);
     }
 
-    public void onDequeue(VideoStats stats, long presentationTimeUs, boolean useFrameRenderTime) {
-        onDequeue(stats, presentationTimeUs, System.nanoTime(), useFrameRenderTime);
+    public long onDequeue(VideoStats stats, long presentationTimeUs, boolean useFrameRenderTime) {
+        return onDequeue(stats, presentationTimeUs, System.nanoTime(), useFrameRenderTime);
     }
 
-    public void onDequeue(VideoStats stats, long presentationTimeUs, long endNs, boolean useFrameRenderTime) {
+    /**
+     * @return this frame's decoder latency in nanoseconds (input enqueue -> output dequeue), or
+     *         {@code -1} when it could not be determined. Callers that only want the stats
+     *         side effect can ignore it; ADPF hinting uses it as the frame's real work duration,
+     *         since the bulk of that time is spent in the out-of-process codec HAL.
+     */
+    public long onDequeue(VideoStats stats, long presentationTimeUs, long endNs, boolean useFrameRenderTime) {
         if (stats == null) {
-            return;
+            return -1L;
         }
 
         final long enqNs = enqueueNsByPtsUs.take(presentationTimeUs);
         if (enqNs == Long.MIN_VALUE) {
             stats.decoderMisses++;
-            return;
+            return -1L;
         }
 
         final long decNs = endNs - enqNs;
@@ -67,6 +73,9 @@ public final class DecodeLatencyTracker {
                 stats.totalTimeMs += e2eMs;
             }
         }
+
+        // Only hand back a value that passed the plausibility check above.
+        return (decUs >= 0 && decUs < 1_000_000L) ? decNs : -1L;
     }
 
     public void maybeCleanup() {

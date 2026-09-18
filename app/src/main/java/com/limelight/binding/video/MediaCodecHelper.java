@@ -534,11 +534,42 @@ public class MediaCodecHelper {
                 ) && !isAdreno620;
     }
 
-    public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int tryNumber) {
+    public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int streamFps, int tryNumber) {
         // Options here should be tried in the order of most to least risky. The decoder will use
         // the first MediaFormat that doesn't fail in configure().
 
         boolean setNewOption = false;
+
+        // --- MTK Pentonic TV preset (mt5896 / TCL G08, AU04 firmware) ---
+        // Unlike the generic MTK branch below, this uses only keys that actually exist in the
+        // TV's vendor decoder (libcodec2_mtk_vdec.so) and reports the stream's real frame
+        // cadence to the codec instead of Short.MAX_VALUE. The standard "low-latency" key is
+        // deliberately omitted here; it returns as part of the fallback presets if this fails.
+        if (tryNumber == 0
+                && Build.HARDWARE != null
+                && Build.HARDWARE.toLowerCase(java.util.Locale.US).startsWith("mt5896")
+                && isDecoderInList(mtkDecoderPrefixes, decoderInfo.getName())) {
+            setNewOption = true;
+
+            final int fps = Math.max(24, Math.min(streamFps > 0 ? streamFps : 60, 240));
+
+            // MediaTek's C2 decoder uses the operating rate as a resource/clock hint. Setting
+            // it exactly to the stream rate can leave the codec in a marginal mode where some
+            // streams start at half rate (30 fps). Doubling it has historically kept this TV
+            // at a steady 60 fps (same idea as the upstream fork's fix).
+            final int operatingRate = Math.min(fps * 2, 240);
+            LimeLog.info("Applying MTK TV (AU04) preset 0 to " + decoderInfo.getName()
+                    + " (operating rate " + operatingRate + " fps, stream " + fps + " fps)");
+
+            safeSet(videoFormat, "vendor.mtk.c2.mode.game", 1);
+            safeSet(videoFormat, "vendor.mtk.c2.mode.lowlatency", 1);
+            safeSet(videoFormat, "vendor.mtk.c2.monitor.latency", 1);
+
+            safeSet(videoFormat, MediaFormat.KEY_OPERATING_RATE, operatingRate);
+            safeSet(videoFormat, MediaFormat.KEY_PRIORITY, 0);
+
+            return true;
+        }
 
 //derflacco
         // NVIDIA Tegra extra low-latency toggles

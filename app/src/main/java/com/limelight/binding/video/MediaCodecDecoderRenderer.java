@@ -193,7 +193,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         @Override
         public void onDequeued(long presentationTimeUs, long dequeueNs) {
             try {
-                decodeLatencyTracker.onDequeue(activeWindowVideoStats, presentationTimeUs, dequeueNs, USE_FRAME_RENDER_TIME);
+                final long decNs = decodeLatencyTracker.onDequeue(
+                        activeWindowVideoStats, presentationTimeUs, dequeueNs, USE_FRAME_RENDER_TIME);
+                if (decNs > 0) {
+                    lastDecodeDurationNs = decNs;
+                }
             } catch (Throwable ignored) { }
         }
     };
@@ -649,6 +653,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.streamTargetFps = (prefs != null) ? (int) prefs.fps : 60;
         this.context = activity;
         this.activity = activity;
+        // null when the device predates API 31 or the power HAL has no hint-session support.
+        this.adpfHintSession = AdpfHintSession.create(activity);
         this.prefs = prefs;
         runtimeOutputDequeueTimeoutCustomEnabled = (prefs != null) && prefs.decoderOutputDequeueTimeoutCustom;
         runtimeOutputDequeueTimeoutUs = (prefs != null) ? prefs.decoderOutputDequeueTimeoutUs : 50000;
@@ -1107,7 +1113,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
             MediaFormat mediaFormat = createBaseMediaFormat(mimeType);
             // This will try low latency options until we find one that works (or we give up).
-            boolean newFormat = MediaCodecHelper.setDecoderLowLatencyOptions(mediaFormat, selectedDecoderInfo, prefs.enableUltraLowLatency, tryNumber);
+            boolean newFormat = MediaCodecHelper.setDecoderLowLatencyOptions(mediaFormat, selectedDecoderInfo, prefs.enableUltraLowLatency, streamTargetFps, tryNumber);
             //todo 色彩格式
 //            MediaCodecInfo.CodecCapabilities codecCapabilities = selectedDecoderInfo.getCapabilitiesForType(mimeType);
 //            int[] colorFormats=codecCapabilities.colorFormats;
@@ -1550,6 +1556,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             if (nextOutputBuffer != null) {
                 final MediaCodec codec = videoDecoder;
                 if (codec != null) {
+                    // In Balanced pacing the renderer thread only enqueues; presentation happens
+                    // here. So this is the per-frame work ADPF needs to hear about.
+                    final long adpfStartNs = System.nanoTime();
                     boolean released = false;
                     try {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -1566,6 +1575,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         lastRenderedFrameTimeNanos = frameTimeNanos;
                         if (activeWindowVideoStats != null) {
                             activeWindowVideoStats.totalFramesRendered++;
+                        }
+                        if (adpfHintSession != null) {
+                            adpfHintSession.reportActualWorkDuration(
+                                    (System.nanoTime() - adpfStartNs) + lastDecodeDurationNs);
                         }
                     } else {
                         try {
@@ -1763,7 +1776,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                     : nowNsLocal;
 
                             // Measure decode latency for the first dequeued buffer too
-                            try { decodeLatencyTracker.onDequeue(activeWindowVideoStats, presentationTimeUs, lastDequeueTimeNs, USE_FRAME_RENDER_TIME); }
+                            try {
+                                final long decNs = decodeLatencyTracker.onDequeue(
+                                        activeWindowVideoStats, presentationTimeUs,
+                                        lastDequeueTimeNs, USE_FRAME_RENDER_TIME);
+                                if (decNs > 0) {
+                                    lastDecodeDurationNs = decNs;
+                                }
+                            }
                             catch (Throwable ignored) { }
 
                             // Sync LFR: take a non-blocking snapshot of the decoder's ready
@@ -1821,7 +1841,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 // The default path avoids "chase newest" draining. The block
                                 // above performs a bounded drain only when Sync LFR is explicitly enabled.
 
-
+                                // ADPF work accounting. Only real CPU work counts: the nano-pacer
+                                // wait below is a deliberate sleep, so it is excluded rather than
+                                // reported as work (which would peg the hint at maximum forever).
+                                long adpfWorkNs = 0L;
+                                long adpfMarkNs = System.nanoTime();
 
                                 final boolean eos =
                                         (lastFlags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0;
@@ -1843,7 +1867,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                     nanoLatest.flags = lastFlags;
                                     nanoLatest.dequeueNs = lastDequeueTimeNs;
 
+                                    // Pause work accounting across the pacing wait.
+                                    adpfWorkNs += System.nanoTime() - adpfMarkNs;
+
                                     numFramesOut += nanoPacer.waitAndDrainLatest(info, nanoLatest, nanoPacerCallbacks);
+
+                                    adpfMarkNs = System.nanoTime();
 
                                     // Pull back the possibly-updated newest output
                                     lastIndex = nanoLatest.index;
@@ -1855,6 +1884,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 releaseBufferAccordingToMode(lastIndex, presentationTimeUs);
 
                                 activeWindowVideoStats.totalFramesRendered++;
+
+                                if (adpfHintSession != null) {
+                                    adpfWorkNs += System.nanoTime() - adpfMarkNs;
+                                    adpfHintSession.reportActualWorkDuration(
+                                            adpfWorkNs + lastDecodeDurationNs);
+                                }
 
                                 // EOS must be handled only after the last buffer is released
                                 if (eos) {
@@ -2108,6 +2143,12 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         initFramePacingFromSettings();
         startRendererThread();
         startChoreographerThread();
+
+        // The renderer thread registers itself with ADPF as it starts, but at that moment the
+        // choreographer thread does not exist yet and the async codec may not have attached.
+        // Re-register now that the full set is up, otherwise the hint covers the renderer alone
+        // and Balanced pacing — which presents on the choreographer thread — goes unhinted.
+        applyAdpfHint();
     }
 
     // !!! May be called even if setup()/start() fails !!!
@@ -2135,6 +2176,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             } catch (Throwable t) {
                 LimeLog.warning("CpuWarmUp stop failed: " + t);
             }
+        }
+
+        // Release the ADPF session before the threads it references exit.
+        if (adpfHintSession != null) {
+            adpfHintSession.close();
         }
 
         // Halt the rendering thread
@@ -3745,6 +3791,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     // ---- Thread priority tuning (runtime) ----
     private volatile int rendererTid = 0;
 
+    /** ADPF hint session for the video threads; null when unsupported. See {@link AdpfHintSession}. */
+    private final AdpfHintSession adpfHintSession;
+
+    /**
+     * Most recent decoder latency (input enqueue -> output dequeue), in nanoseconds.
+     *
+     * <p>This is the dominant cost of a frame and it is spent almost entirely in the codec HAL,
+     * which runs in a *different process* and therefore cannot be a member of our hint session.
+     * Reporting only our in-process render slice would tell the power HAL we have ~99% headroom
+     * against the frame deadline and invite it to drop clocks, so the ADPF report is this value
+     * plus the local render work.
+     */
+    private volatile long lastDecodeDurationNs = 0L;
+
     private int getEffectivePacingForThreadPriorities() {
         // Prefer prefs (current intent), but keep applied if it matches (avoid stale override).
         final int prefsPacing = (prefs != null) ? prefs.framePacing : PreferenceConfiguration.FRAME_PACING_BALANCED;
@@ -3796,6 +3856,58 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return Process.THREAD_PRIORITY_DISPLAY;
     }
 
+    /**
+     * Per-frame deadline handed to the power HAL: the interval between arriving stream frames.
+     * That is the rate the decode+render path has to keep up with, so it is the deadline the
+     * HAL should be sizing clocks against.
+     */
+    private long adpfTargetWorkDurationNs() {
+        int fps = streamTargetFps;
+        if (fps <= 0) {
+            fps = (refreshRate > 0) ? refreshRate : 60;
+        }
+        // Guard against absurd values from a malformed preference.
+        fps = Math.max(24, Math.min(fps, 480));
+        return 1_000_000_000L / fps;
+    }
+
+    /**
+     * Registers the video pipeline's threads with ADPF so the power HAL raises their clocks.
+     * Called from {@link #applyVideoThreadPriorities()} because that is already the single point
+     * where the full thread set is known and where every lifecycle/settings change lands.
+     */
+    private void applyAdpfHint() {
+        final AdpfHintSession hint = adpfHintSession;
+        if (hint == null) {
+            return;
+        }
+
+        final Thread rt = rendererThread;
+        final HandlerThread cb = asyncCodec.getCallbackThread();
+        // Only present in Balanced pacing; startChoreographerThread() returns early otherwise.
+        final HandlerThread choreo = choreographerHandlerThread;
+
+        final int rendererId = rendererTid;
+        final int cbId = (cb != null) ? cb.getThreadId() : 0;
+        final int choreoId = (choreo != null) ? choreo.getThreadId() : 0;
+
+        // A thread that exists and is alive but has not published its TID yet would otherwise be
+        // silently dropped from the set. Because configure() *replaces* the set, that turns a
+        // "not ready yet" into "unregistered", and the churn can momentarily deregister the
+        // renderer thread — the one thread that matters most. Defer instead, and let the next
+        // call (there is always one) install the complete set.
+        final boolean pending =
+                (rt != null && rt.isAlive() && rendererId <= 0)
+                        || (cb != null && cb.isAlive() && cbId <= 0)
+                        || (choreo != null && choreo.isAlive() && choreoId <= 0);
+
+        if (pending && hint.isActive()) {
+            return;
+        }
+
+        hint.configure(new int[] { rendererId, cbId, choreoId }, adpfTargetWorkDurationNs());
+    }
+
     private void applyVideoThreadPriorities() {
         final int pacing = getEffectivePacingForThreadPriorities();
 
@@ -3831,6 +3943,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (choreo != null) {
             try { Process.setThreadPriority(choreo.getThreadId(), choreoPrio); } catch (Throwable ignored) { }
         }
+
+        // Nice values only reorder threads against each other; ADPF is what actually raises the
+        // clock they run at. Keep both in sync from the same place.
+        applyAdpfHint();
     }
 
 }
