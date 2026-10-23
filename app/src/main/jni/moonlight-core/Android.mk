@@ -49,6 +49,11 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/moonlight-common-c/enet/include \
 
 LOCAL_CFLAGS := -DHAS_SOCKLEN_T=1 -DLC_ANDROID -DHAVE_CLOCK_GETTIME=1
 
+# The optimized Artemide APK is quiet; other variants retain native diagnostics.
+ifeq ($(APP_LOGGING),0)
+LOCAL_CFLAGS += -DARTEMIDE_NO_LOGGING
+endif
+
 ifeq ($(NDK_DEBUG),1)
 LOCAL_CFLAGS += -DLC_DEBUG
 endif

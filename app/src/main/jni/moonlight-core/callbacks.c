@@ -390,10 +390,12 @@ void BridgeClSetControllerLED(uint16_t controllerNumber, uint8_t r, uint8_t g, u
 }
 
 void BridgeClLogMessage(const char* format, ...) {
+#ifndef ARTEMIDE_NO_LOGGING
     va_list va;
     va_start(va, format);
     __android_log_vprint(ANDROID_LOG_INFO, "moonlight-common-c", format, va);
     va_end(va);
+#endif
 }
 
 static DECODER_RENDERER_CALLBACKS BridgeVideoRendererCallbacks = {

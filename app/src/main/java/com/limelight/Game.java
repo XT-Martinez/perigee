@@ -45,6 +45,7 @@ import com.limelight.ui.ExternalControllerView;
 import com.limelight.ui.GameGestures;
 import com.limelight.ui.StreamContainer;
 import com.limelight.utils.Dialog;
+import com.limelight.utils.DisplayRateTracker;
 import com.limelight.utils.ExternalDisplayControlActivity;
 import com.limelight.utils.MouseModeOption;
 import com.limelight.utils.PanZoomHandler;
@@ -165,13 +166,21 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         try {
             final Game inst = instance;
             if (inst == null) return;
+            // With direct SurfaceView playback the codec's HDR/PQ buffer is composed as its
+            // own layer. Keep the Activity window in its default SDR mode, like Nova, rather
+            // than forcing HDR on the UI layer whenever the stream changes format. The GL
+            // upscaler presents through the window and retains the existing HDR mode path.
+            if (inst.prefConfig != null && !inst.prefConfig.videoUpscaleEnable) return;
             if (android.os.Build.VERSION.SDK_INT >= 26) {
                 inst.runOnUiThread(() -> {
                     try {
                         inst.getWindow().setColorMode(enable
                                 ? ActivityInfo.COLOR_MODE_HDR
                                 : ActivityInfo.COLOR_MODE_DEFAULT);
-                        LimeLog.info("Display HDR mode: " + (enable ? "enabled" : "disabled"));
+                        // Keep this distinct from Game.setHdrMode()'s "Display HDR mode" log, which
+                        // reports host stream metadata rather than an Activity window color-mode
+                        // change.
+                        LimeLog.info("Display HDR window color mode: " + (enable ? "enabled" : "disabled"));
                     } catch (Throwable t) {
                         LimeLog.warning("HDR window mode switch failed: " + t);
                     }
@@ -337,6 +346,12 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     private MediaCodecDecoderRenderer decoderRenderer;
     private boolean reportedCrash;
+
+    // Tracks the display actually hosting the stream view and its live refresh rate so the
+    // renderer's pacing does not keep using the rate sampled once at setup().
+    private DisplayRateTracker displayRateTracker;
+    // Kept so the external-display removal listener can be unregistered at teardown.
+    private DisplayManager.DisplayListener externalDisplayRemovalListener;
 
     private WifiManager.WifiLock highPerfWifiLock;
     private WifiManager.WifiLock lowLatencyWifiLock;
@@ -824,6 +839,19 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 glPrefs.glRenderer,
                 this);
 
+        // Track the display that actually hosts the stream view. Attaching/removing a USB-C
+        // monitor (or a display migration) can move the hosting panel between e.g. 120 Hz and
+        // 60 Hz without recreating the activity; pacing must not keep using the setup() rate.
+        displayRateTracker = new DisplayRateTracker(this, streamContainer,
+                new DisplayRateTracker.Listener() {
+                    @Override
+                    public void onDisplayPacingChanged(int displayId, float refreshRateHz,
+                                                       boolean identityChanged) {
+                        onHostingDisplayPacingChanged(displayId, refreshRateHz, identityChanged);
+                    }
+                });
+        displayRateTracker.start();
+
         // Only GlUpscale (FSR or FastGL) needs a display/view-sized producer Surface.
         // The normal MediaCodec direct path must keep its original Surface sizing behavior.
         installGlUpscaleSizerIfNeeded();
@@ -1102,7 +1130,11 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
 
     private void listenForExternalDisplayRemoval() {
         DisplayManager displayManager = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
-        displayManager.registerDisplayListener(new DisplayManager.DisplayListener() {
+
+        // Avoid leaking a previous registration if this is ever called more than once.
+        unregisterExternalDisplayListener();
+
+        externalDisplayRemovalListener = new DisplayManager.DisplayListener() {
             @Override
             public void onDisplayAdded(int displayId) {
             }
@@ -1118,7 +1150,26 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             @Override
             public void onDisplayChanged(int displayId) {
             }
-        }, null);
+        };
+
+        displayManager.registerDisplayListener(externalDisplayRemovalListener, null);
+    }
+
+    private void unregisterExternalDisplayListener() {
+        final DisplayManager.DisplayListener listener = externalDisplayRemovalListener;
+        externalDisplayRemovalListener = null;
+        if (listener == null) {
+            return;
+        }
+
+        try {
+            DisplayManager displayManager =
+                    (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+            if (displayManager != null) {
+                displayManager.unregisterDisplayListener(listener);
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     private void handleDisplayRemoved() {
@@ -1374,6 +1425,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 UiHelper.notifyStreamExitingPiP(this);
             }
         }
+
+        // Display size/rate or window configuration may have changed with this callback.
+        refreshHostingDisplayRate();
     }
 
     @TargetApi(Build.VERSION_CODES.O)
@@ -1652,18 +1706,38 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             LimeLog.info("Best display mode: "+bestMode.getPhysicalWidth()+"x"+
                     bestMode.getPhysicalHeight()+"x"+bestMode.getRefreshRate());
 
-            // Only apply new window layout parameters if we've actually changed the display mode
+            // Keep an explicit window-level high-refresh mode request for >60 FPS streams, even
+            // when the selected mode is already current. Devices can report the high-refresh mode
+            // as active during selection and then fall back to 60 Hz when rendering begins;
+            // during an HDR codec restart the display can also bounce 60 -> 120. For
+            // same-resolution streams on Android 12+ the only other request is
+            // Surface.setFrameRate(DEFAULT), which is kept as-is. This mirrors Nova's
+            // pinHighRefreshMode and adds no device gating beyond fps/refresh > 60.
+            final boolean pinHighRefreshMode =
+                    prefConfig.fps > 60 && bestMode.getRefreshRate() > 60;
+            boolean applyWindowModeAttributes = false;
+
+            if (pinHighRefreshMode) {
+                windowLayoutParams.preferredDisplayModeId = bestMode.getModeId();
+                applyWindowModeAttributes = true;
+            }
+
+            // The high-refresh pin above applies regardless of whether the mode changed; this
+            // block keeps the existing mode-change policy: only apply window layout parameters
+            // when the selected mode differs, and prefer setFrameRate() for same-resolution
+            // refresh-only changes on Android 12+.
             if (currentDisplay.getMode().getModeId() != bestMode.getModeId()) {
                 // If we only changed refresh rate and we're on an OS that supports Surface.setFrameRate()
                 // use that instead of using preferredDisplayModeId to avoid the possibility of triggering
                 // bugs that can cause the system to switch from 4K60 to 4K24 on Chromecast 4K.
-                if (prefConfig.enforceDisplayMode ||
+                if (pinHighRefreshMode ||
+                        prefConfig.enforceDisplayMode ||
                         Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
                         currentDisplay.getMode().getPhysicalWidth() != bestMode.getPhysicalWidth() ||
                         currentDisplay.getMode().getPhysicalHeight() != bestMode.getPhysicalHeight()) {
                     // Apply the display mode change
                     windowLayoutParams.preferredDisplayModeId = bestMode.getModeId();
-                    getWindow().setAttributes(windowLayoutParams);
+                    applyWindowModeAttributes = true;
                 }
                 else {
                     LimeLog.info("Using setFrameRate() instead of preferredDisplayModeId due to matching resolution");
@@ -1671,6 +1745,15 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             }
             else {
                 LimeLog.info("Current display mode is already the best display mode");
+            }
+
+            // A single setAttributes() covers both the high-refresh pin and any mode change.
+            if (applyWindowModeAttributes) {
+                getWindow().setAttributes(windowLayoutParams);
+                if (pinHighRefreshMode) {
+                    LimeLog.info("Pinned high-refresh window display mode " + bestMode.getModeId() +
+                            " at " + bestMode.getRefreshRate() + " Hz");
+                }
             }
 
             displayRefreshRate = bestMode.getRefreshRate();
@@ -1813,16 +1896,20 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 return;
             }
 
+            // Use DEFAULT for the interactive stream's display-rate request. A focused
+            // DEFAULT vote can select rates in Android's app-request range even when HDR
+            // high-brightness policy restricts the primary range to 60 Hz. FIXED_SOURCE's
+            // ExactOrMultiple vote does not receive that exception in AOSP's selector.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 s.setFrameRate(
                         desiredFrameRate,
-                        Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                        Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
                         Surface.CHANGE_FRAME_RATE_ALWAYS
                 );
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 s.setFrameRate(
                         desiredFrameRate,
-                        Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE
+                        Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
                 );
             } else {
                 // Pre-R: best-effort is handled via preferredRefreshRate/preferredDisplayModeId elsewhere.
@@ -1833,6 +1920,42 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             LimeLog.info("Applied Surface frame-rate hint: " + desiredFrameRate + " fps");
         } catch (Throwable t) {
             LimeLog.warning("Surface.setFrameRate() failed: " + t);
+        }
+    }
+
+    /**
+     * Applies a live hosting-display pacing change reported by {@link DisplayRateTracker}.
+     *
+     * <p>The renderer only publishes the change; its pacing threads perform their own reset. The
+     * present Surface frame-rate request is independent of the panel rate (it asks for the stream
+     * FPS), so a rate-only change must not re-issue it: on a display that is intentionally paced
+     * slower (for example a 60 Hz USB-C monitor), re-requesting the panel's previous rate would
+     * fight the system. A display identity change is different: the old request belonged to the
+     * previous display, so it is re-applied once.
+     */
+    private void onHostingDisplayPacingChanged(int displayId, float refreshRateHz,
+                                               boolean identityChanged) {
+        if (identityChanged) {
+            lastAppliedSurfaceFrameRate = -1f;
+        }
+
+        final MediaCodecDecoderRenderer renderer = decoderRenderer;
+        if (renderer != null) {
+            renderer.updateHostingDisplayPacing(displayId, refreshRateHz);
+        }
+
+        // Idempotent: skips when the same request is already applied, so this cannot loop.
+        applySurfaceFrameRateHintIfPossible();
+    }
+
+    /**
+     * Re-resolves the hosting display outside of DisplayManager callbacks. Used from lifecycle and
+     * surface points as a safety net for changes that were not delivered as a callback.
+     */
+    private void refreshHostingDisplayRate() {
+        final DisplayRateTracker tracker = displayRateTracker;
+        if (tracker != null) {
+            tracker.refresh();
         }
     }
 
@@ -1902,6 +2025,13 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         }
         timerHandler.removeCallbacksAndMessages(null);
 
+        // Unregister display listeners before the activity goes away.
+        if (displayRateTracker != null) {
+            displayRateTracker.stop();
+            displayRateTracker = null;
+        }
+        unregisterExternalDisplayListener();
+
         // Put the TV's pre-stream picture/audio settings back once the last live stream
         // activity is gone. Safe even after a crash, and a no-op when nothing was changed.
         TclGameModeProfile.onStreamEnd(getApplicationContext());
@@ -1970,6 +2100,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
             compositorHeartbeat.start();
         }
         try { if (fsrSizer != null) fsrSizer.start(); } catch (Throwable ignored) {}
+        refreshHostingDisplayRate();
     }
 
     @Override
@@ -4031,7 +4162,9 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
                 updatePipAutoEnter();
             }
         }
-        // Surface may have been resized/recreated; re-apply frame-rate hint
+        // Surface may have been resized/recreated; re-check the hosting display and re-apply the
+        // frame-rate hint.
+        refreshHostingDisplayRate();
         applySurfaceFrameRateHintIfPossible();
 
     }
@@ -4041,6 +4174,7 @@ public class Game extends AppCompatActivity implements SurfaceHolder.Callback,
         surfaceCreated = true;
 
         // Apply (or re-apply) frame-rate hint to the actual present Surface
+        refreshHostingDisplayRate();
         applySurfaceFrameRateHintIfPossible();
     }
 

@@ -202,6 +202,22 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
     };
 
+    /**
+     * Consumes live display-pacing changes on the renderer thread, which owns NanoPacer.
+     * Resetting NanoPacer from the display callback thread could race
+     * {@code waitAndDrainLatest()} and re-arm a deadline computed from the old interval.
+     */
+    private void maybeResetNanoPacerForDisplayChange() {
+        if (!nanoPacerDisplayConsumer.onNewState(displayPacing)) {
+            return;
+        }
+
+        final DisplayPacingSignal.State state = displayPacing.getState();
+        nanoPacer.reset();
+        LimeLog.info("NanoPacer: reset for display change (display " + state.displayId
+                + " at " + state.refreshRateHz + " Hz)");
+    }
+
     // ==== End Nano Pacer  ====
 
 
@@ -354,9 +370,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Apply only via restart/reset. Do NOT flip useAsyncCodec while executing.
         if (!stopping && videoDecoder != null) {
-            if (codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_NONE, CR_RECOVERY_TYPE_RESTART) ||
-                    codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_FLUSH, CR_RECOVERY_TYPE_RESTART)) {
-                LimeLog.info("Async decode mode change requested -> decoder restart (desired=" +
+            // Leaving block mode also changes the input API contract; reset before sync calls.
+            final int recovery = blockInputActive && !desired
+                    ? CR_RECOVERY_TYPE_RESET : CR_RECOVERY_TYPE_RESTART;
+            if (codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_NONE, recovery) ||
+                    codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_FLUSH, recovery) ||
+                    (recovery == CR_RECOVERY_TYPE_RESET &&
+                            codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_RESTART, recovery))) {
+                LimeLog.info("Async decode mode change requested -> decoder " +
+                        (recovery == CR_RECOVERY_TYPE_RESET ? "reset" : "restart") + " (desired=" +
                         (desired ? "async" : "sync") + ")");
             }
         }
@@ -392,8 +414,27 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private long lastTimestampUs;
     private int lastFrameNumber;
     private int refreshRate;
-    private float refreshRateHz;
     private PreferenceConfiguration prefs;
+
+    // ---- Live hosting-display pacing snapshot ----
+    // The display rate used to be cached once in setup(). Attaching/removing a USB-C monitor (or
+    // migrating displays) can change the hosting panel's rate without recreating the activity, so
+    // the rate is published as an immutable snapshot. Each pacing thread consumes changes itself
+    // (see the consumers below) instead of having a display callback reset its state.
+    private final DisplayPacingSignal displayPacing = new DisplayPacingSignal();
+    private final DisplayPacingSignal.Consumer nanoPacerDisplayConsumer =
+            new DisplayPacingSignal.Consumer();
+    private final DisplayPacingSignal.Consumer balancedDisplayConsumer =
+            new DisplayPacingSignal.Consumer();
+
+    // ---- Balanced release-timestamp experiment (perfDebug only) ----
+    // Nova's Balanced path presents at Choreographer frameTimeNanos - appVsyncOffsetNanos, i.e.
+    // aligned to the hardware-vsync timeline rather than the app-vsync time. The offset is read
+    // from the hosting display on the main thread (stream setup and display changes) and published
+    // for the Choreographer thread. It is never read or applied unless
+    // BuildConfig.BALANCED_SUBTRACT_APP_VSYNC_OFFSET is compiled in, so normal builds are
+    // byte-for-byte unchanged in behavior.
+    private volatile long hostedAppVsyncOffsetNanos;
 
     // ---- Runtime frame pacing refresh (overlay-first, UI fallback) ----
     private static final long FRAME_PACING_POLL_INTERVAL_NS = 250_000_000L; // 250 ms
@@ -622,6 +663,56 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (glUpscaler != null) {
             applyUpscalerPresentationHint();
         }
+    }
+
+    /**
+     * Called (from the main thread) when the display that actually hosts the stream view changes
+     * identity or effective refresh rate. The change is only published here; the renderer thread
+     * and the Choreographer thread consume it and reset the pacing state they own, so no display
+     * callback can race {@code doFrame()} or {@code NanoPacer.waitAndDrainLatest()}.
+     */
+    public void updateHostingDisplayPacing(int displayId, float refreshRateHz) {
+        // Keep the experiment offset current even when the rate/identity did not change; this runs
+        // on the main thread and is a no-op when the experiment is compiled out.
+        refreshAppVsyncOffsetForExperiment();
+
+        if (!displayPacing.update(displayId, refreshRateHz)) {
+            return;
+        }
+
+        final DisplayPacingSignal.State state = displayPacing.getState();
+        LimeLog.info("Video pacing: hosting display " + state.displayId + " at "
+                + state.refreshRateHz + " Hz (stream target " + streamTargetFps + " fps)");
+    }
+
+    /**
+     * Refreshes the cached app vsync offset used by the Balanced release-timestamp experiment.
+     *
+     * <p>Must be called on the main thread (stream setup and hosting-display changes); the
+     * Choreographer thread only reads the volatile. This is a no-op when
+     * {@code BuildConfig.BALANCED_SUBTRACT_APP_VSYNC_OFFSET} is false, so no display query is added
+     * to normal builds. {@link android.view.Display#getAppVsyncOffsetNanos()} is documented as a
+     * positive phase offset of the Choreographer vsync relative to the display refresh, so
+     * subtracting it never moves the timestamp into the future.
+     */
+    private void refreshAppVsyncOffsetForExperiment() {
+        if (!BuildConfig.BALANCED_SUBTRACT_APP_VSYNC_OFFSET) {
+            return;
+        }
+
+        long offset = 0L;
+        try {
+            final android.view.Display display = resolveHostingDisplay();
+            if (display != null) {
+                offset = display.getAppVsyncOffsetNanos();
+            }
+        } catch (Throwable ignored) {
+        }
+
+        if (offset != hostedAppVsyncOffsetNanos) {
+            LimeLog.info("Balanced release-time experiment: app vsync offset " + offset + " ns");
+        }
+        hostedAppVsyncOffsetNanos = offset;
     }
 
     public void setUpscalerPresentationSizeHint(int width, int height) {
@@ -863,7 +954,51 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         return videoFormat;
     }
 
+    private volatile boolean blockInputActive;
+    private volatile boolean blockInputDisabled;
+    private BlockCodecInput blockCodecInput;
+
+    private boolean shouldUseBlockInput() {
+        return !blockInputDisabled && BlockCodecInput.shouldEnable(
+                BuildConfig.AV1_BLOCK_INPUT_EXPERIMENT, prefs != null && prefs.enableAdpfHint,
+                Build.VERSION.SDK_INT, (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_AV1) != 0,
+                coldCfg.av1Decoder != null ? coldCfg.av1Decoder.getName() : null,
+                Build.DEVICE, Build.PRODUCT, Build.MODEL, useAsyncCodec,
+                getEffectivePacingForThreadPriorities() == PreferenceConfiguration.FRAME_PACING_BALANCED,
+                prefs != null && prefs.videoUpscaleEnable, coldCfg.initialWidth, coldCfg.initialHeight);
+    }
+
+    private void requestBlockInputFallback(Throwable error) {
+        if (stopping) return;
+        if (!blockInputDisabled) {
+            LimeLog.warning("Block input: disabling for this stream; reset to legacy: " + error);
+        }
+        blockInputDisabled = true;
+        // Do not switch APIs on an executing block codec. The normal quiescence protocol
+        // resets it first, reinstalls callbacks and requests an IDR for the new generation.
+        if (!codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_NONE, CR_RECOVERY_TYPE_RESET)) {
+            if (!codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_FLUSH, CR_RECOVERY_TYPE_RESET)) {
+                codecRecoveryType.compareAndSet(CR_RECOVERY_TYPE_RESTART, CR_RECOVERY_TYPE_RESET);
+            }
+        }
+    }
+
     private void configureAndStartDecoder(MediaFormat format) {
+        final boolean blockAttempt = shouldUseBlockInput();
+        try {
+            configureAndStartDecoderOnce(format);
+        } catch (IllegalArgumentException | IllegalStateException error) {
+            if (!blockAttempt || stopping) throw error;
+            blockInputDisabled = true;
+            LimeLog.warning("Block input: setup rejected; bounded legacy fallback: " + error);
+            resetInputBufferState();
+            detachAsyncCodec();
+            videoDecoder.reset();
+            configureAndStartDecoderOnce(format);
+        }
+    }
+
+    private void configureAndStartDecoderOnce(MediaFormat format) {
         // Set HDR metadata if present
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             if (coldCfg.currentHdrMetadata != null) {
@@ -921,7 +1056,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         // Enable async callbacks before configure (required by MediaCodec async mode contract)
         try { attachAsyncCodecIfNeeded(); } catch (Throwable ignored) {}
 
-        videoDecoder.configure(format, __codecSurface, null, 0);
+        blockInputActive = shouldUseBlockInput();
+        if (blockInputActive && !isAsyncDecodingActive()) {
+            throw new IllegalStateException("Block input requires installed async callbacks");
+        }
+        blockCodecInput = blockInputActive ? BlockCodecInput.platform(coldCfg.av1Decoder.getName()) : null;
+        videoDecoder.configure(format, __codecSurface, null,
+                blockInputActive ? MediaCodec.CONFIGURE_FLAG_USE_BLOCK_MODEL : 0);
 
         // Apply frame-rate hint also to the decoder output surface (important when using GL upscaler input surface).
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && __codecSurface != null && __codecSurface != renderTarget) {
@@ -992,7 +1133,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         // Start the decoder
         videoDecoder.start();
+        LimeLog.info("Block input: " + (blockInputActive ? "ACTIVE (payload-sized AV1 blocks)" : "legacy"));
         MediaCodecHelper.applyFrameworkLowLatencyPostStart(videoDecoder);
+        // stop/reset can reuse the codec object but replace its worker. Revalidate only on
+        // recovery, never per frame; fresh creation resolves the active before/after capture.
+        if (adpfThreadDiscovery != null && !adpfThreadDiscovery.isCapturing()
+                && !adpfThreadDiscovery.isStillValid(adpfWorkerIdentity)) {
+            adpfWorkerIdentity = null;
+        }
 // Diagnostics: dump negotiated input/output formats and check vendor keys acceptance
         try {
             MediaFormat __inF = videoDecoder.getInputFormat();
@@ -1011,6 +1159,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     private boolean tryConfigureDecoder(MediaCodecInfo selectedDecoderInfo, MediaFormat format, boolean throwOnCodecError) {
         boolean configured = false;
+        final CodecThreadDiscovery discovery = adpfThreadDiscovery;
+        adpfWorkerIdentity = null;
+        if (discovery != null) {
+            discovery.beginCapture();
+        }
         try {
             videoDecoder = MediaCodec.createByCodecName(selectedDecoderInfo.getName());
             configureAndStartDecoder(format);
@@ -1033,8 +1186,21 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
         } finally {
             if (!configured && videoDecoder != null) {
+                try { detachAsyncCodec(); } catch (Throwable ignored) { }
                 videoDecoder.release();
                 videoDecoder = null;
+                blockInputActive = false;
+                blockCodecInput = null;
+            }
+            if (discovery != null) {
+                if (configured) {
+                    adpfWorkerIdentity = discovery.finishCapture();
+                    LimeLog.info("ADPF submission: worker discovery " + (adpfWorkerIdentity != null
+                            ? "tid=" + adpfWorkerIdentity.tid
+                            : "none/ambiguous/unverifiable; input-only"));
+                } else {
+                    discovery.cancelCapture();
+                }
             }
         }
         return configured;
@@ -1108,6 +1274,24 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         coldCfg.adaptivePlayback = MediaCodecHelper.decoderSupportsAdaptivePlayback(selectedDecoderInfo, mimeType);
         coldCfg.fusedIdrFrame = MediaCodecHelper.decoderSupportsFusedIdrFrame(selectedDecoderInfo, mimeType);
 
+        if (!submissionHintsSelected && AdpfSubmissionSession.shouldEnable(
+                prefs != null && prefs.enableAdpfHint, Build.VERSION.SDK_INT,
+                (videoFormat & MoonBridge.VIDEO_FORMAT_MASK_AV1) != 0, selectedDecoderInfo.getName(),
+                Build.DEVICE, Build.PRODUCT, Build.MODEL)) {
+            submissionHintsSelected = true;
+            // The two policies must never hint overlapping threads or report different work
+            // units for the same stream. Off/unsupported scope retains the original policy.
+            if (adpfHintSession != null) {
+                adpfHintSession.close();
+            }
+            adpfSubmissionSession = AdpfSubmissionSession.create(context);
+            if (adpfSubmissionSession != null && AdpfSubmissionSession.shouldUseWorkerThread(
+                    BuildConfig.ADPF_TWO_THREAD_EXPERIMENT,
+                    prefs.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED)) {
+                adpfThreadDiscovery = new CodecThreadDiscovery(CodecThreadDiscovery.procReader());
+            }
+        }
+
         for (int tryNumber = 0;; tryNumber++) {
             LimeLog.info("Decoder configuration try: "+tryNumber);
 
@@ -1120,16 +1304,41 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 //            for (int colorFormat : colorFormats) {
 //                LimeLog.info("Decoder configuration colorFormats: "+colorFormat);
 //            }
-            // Throw the underlying codec exception on the last attempt if the caller requested it
-            if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, !newFormat && throwOnCodecError)) {
-                // Success!
+
+            if (newFormat) {
+                // A less risky preset is still available; failure here is never fatal, matching
+                // the historical `!newFormat && throwOnCodecError` call for this branch.
+                if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, false)) {
+                    break;
+                }
+                continue;
+            }
+
+            // Terminal attempt: no further low-latency preset remains. In opted-in builds the
+            // experiment hint rides this attempt too, so try it first; if the decoder rejects it,
+            // retry once without the hint so an unsupported hint cannot keep AV1 from starting.
+            // This is a single bounded retry (no loop), and it is logged so an A/B run is never
+            // silently hint-free. Non-experiment builds keep the exact historical behavior.
+            final boolean hintApplicable =
+                    MediaCodecHelper.isAv1OperatingRate240HintApplicable(mediaFormat, selectedDecoderInfo);
+
+            if (hintApplicable) {
+                if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, false)) {
+                    break;
+                }
+
+                MediaFormat cleanFormat = createBaseMediaFormat(mimeType);
+                MediaCodecHelper.setDecoderLowLatencyOptions(cleanFormat, selectedDecoderInfo, prefs.enableUltraLowLatency, streamTargetFps, tryNumber, false);
+                if (tryConfigureDecoder(selectedDecoderInfo, cleanFormat, throwOnCodecError)) {
+                    LimeLog.warning("AV1 operating-rate 240 experiment fallback: decoder started without hint");
+                    break;
+                }
+            } else if (tryConfigureDecoder(selectedDecoderInfo, mediaFormat, throwOnCodecError)) {
                 break;
             }
 
-            if (!newFormat) {
-                // We couldn't even configure a decoder without any low latency options
-                return -5;
-            }
+            // We couldn't even configure a decoder without any low latency options
+            return -5;
         }
 
         if (USE_FRAME_RENDER_TIME && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -1158,38 +1367,95 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         this.coldCfg.initialHeight = coldCfg.invertResolution ? width : height;
         this.videoFormat = format;
         this.refreshRate = redrawRate;
-        this.refreshRateHz = queryDisplayRefreshRateHz();
-        if (this.refreshRateHz <= 1f) {
-            this.refreshRateHz = (float) redrawRate;
-        }
-        if (this.refreshRateHz <= 1f) {
-            this.refreshRateHz = 60f;
-        }
+        initializeHostingDisplayPacingFromSystem();
         initAsyncDecodingFromSettings();
         return initializeDecoder(false);
     }
 
-    private float queryDisplayRefreshRateHz() {
+    /**
+     * Initial hosting-display snapshot for a new stream. Falls back to the stream-requested rate
+     * and then 60 Hz, preserving the historic behavior when no display can be queried. A valid
+     * live snapshot is left untouched if this setup-time query fails.
+     */
+    private void initializeHostingDisplayPacingFromSystem() {
+        // Prime the Balanced release-timestamp experiment offset for this stream; a no-op unless
+        // the debug experiment is compiled in.
+        refreshAppVsyncOffsetForExperiment();
+
+        int displayId = -1;
+        float refreshRateHz = 0f;
+
         try {
-            if (activity != null) {
-                final android.view.Display d = activity.getDisplay();
-                if (d != null) {
-                    final float rr = d.getRefreshRate();
-                    if (rr > 1f && rr < 1000f) {
-                        return rr;
-                    }
+            final android.view.Display display = resolveHostingDisplay();
+            if (display != null) {
+                displayId = display.getDisplayId();
+                refreshRateHz = readRefreshRateHz(display);
+            }
+        } catch (Throwable ignored) { }
+
+        if (!DisplayPacingSignal.isValidRate(refreshRateHz)) {
+            // Do not replace a live snapshot published by Game's DisplayRateTracker with the
+            // stream-requested fallback: that snapshot came from the hosting view's actual display.
+            final DisplayPacingSignal.State current = displayPacing.getState();
+            if (DisplayPacingSignal.isValidRate(current.refreshRateHz)) {
+                return;
+            }
+
+            refreshRateHz = (refreshRate > 0) ? (float) refreshRate : 60f;
+        }
+
+        displayPacing.update(displayId, refreshRateHz);
+    }
+
+    /**
+     * Live validated hosting-display refresh rate with the same fallbacks the renderer used when
+     * the rate was cached at setup() time.
+     */
+    private float getEffectiveDisplayRefreshRateHz() {
+        final float liveHz = displayPacing.getState().refreshRateHz;
+        if (DisplayPacingSignal.isValidRate(liveHz)) {
+            return liveHz;
+        }
+
+        return (refreshRate > 0) ? (float) refreshRate : 60f;
+    }
+
+    private android.view.Display resolveHostingDisplay() {
+        try {
+            if (activity != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                final android.view.Display display = activity.getDisplay();
+                if (display != null) {
+                    return display;
                 }
             }
         } catch (Throwable ignored) { }
 
         try {
             if (activity != null && activity.getWindowManager() != null) {
-                final android.view.Display d = activity.getWindowManager().getDefaultDisplay();
-                if (d != null) {
-                    final float rr = d.getRefreshRate();
-                    if (rr > 1f && rr < 1000f) {
-                        return rr;
-                    }
+                return activity.getWindowManager().getDefaultDisplay();
+            }
+        } catch (Throwable ignored) { }
+
+        return null;
+    }
+
+    private static float readRefreshRateHz(android.view.Display display) {
+        if (display == null) {
+            return 0f;
+        }
+
+        try {
+            final float liveHz = display.getRefreshRate();
+            if (DisplayPacingSignal.isValidRate(liveHz)) {
+                return liveHz;
+            }
+        } catch (Throwable ignored) { }
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && display.getMode() != null) {
+                final float modeHz = display.getMode().getRefreshRate();
+                if (DisplayPacingSignal.isValidRate(modeHz)) {
+                    return modeHz;
                 }
             }
         } catch (Throwable ignored) { }
@@ -1218,9 +1484,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
             // This is the final thread to quiesce, so let's perform the codec recovery now.
             if (codecRecoveryThreadQuiescedFlags == CR_FLAG_ALL) {
+                adpfCodecGeneration++;
+                if (adpfSubmissionSession != null) {
+                    adpfSubmissionSession.clearWorker();
+                }
                 // Input and output buffers are invalidated by stop() and reset().
                 nextInputBuffer = null;
                 nextInputBufferIndex = -1;
+
+                // Balanced pacing holds chosen output indices in its own queue until the
+                // Choreographer thread presents them. Any entry left here belongs to the codec
+                // generation being torn down; releasing it on the reconfigured codec afterwards
+                // would target an invalid or reused buffer index. Release what is still valid
+                // before flush/stop (Nova clears its equivalent queue at this same point).
+                drainOutputBufferQueueNoRender();
 
                 // Async
                 try { asyncCodec.quiesceAndRelease(videoDecoder, asyncOutputRelease); } catch (Throwable ignored) { }
@@ -1515,8 +1792,20 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         ? prefs.fps
                         : (streamTargetFps > 0 ? (float) streamTargetFps : 60f);
 
-        final float displayHz =
-                (refreshRateHz > 1f) ? refreshRateHz : ((refreshRate > 0) ? (float) refreshRate : 60f);
+        // The Choreographer thread owns the Balanced ratio fields, so it consumes display changes
+        // here. A display callback must never reset them from another thread mid-doFrame().
+        if (balancedDisplayConsumer.onNewState(displayPacing)) {
+            final DisplayPacingSignal.State state = displayPacing.getState();
+            lastPacingStreamFps = -1f;
+            lastPacingDisplayHz = -1f;
+            vsyncsPerFrame = 1.0;
+            vsyncAccumulator = 0.0;
+            lastRenderedFrameTimeNanos = 0L;
+            LimeLog.info("Balanced pacing: ratio reset for display change (display "
+                    + state.displayId + " at " + state.refreshRateHz + " Hz)");
+        }
+
+        final float displayHz = getEffectiveDisplayRefreshRateHz();
 
         // Recompute ratio when inputs change.
         if (Math.abs(streamFps - lastPacingStreamFps) > 0.01f ||
@@ -1560,9 +1849,16 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     // here. So this is the per-frame work ADPF needs to hear about.
                     final long adpfStartNs = System.nanoTime();
                     boolean released = false;
+                    // EXPERIMENT (perfDebug only): Nova's Balanced path subtracts the display's
+                    // app vsync offset before releaseOutputBufferAtTime, aligning the desired
+                    // present time to the hardware-vsync timeline instead of the app-vsync time.
+                    // Compiled out in every other build.
+                    final long releaseTimeNs = BuildConfig.BALANCED_SUBTRACT_APP_VSYNC_OFFSET
+                            ? (frameTimeNanos - hostedAppVsyncOffsetNanos)
+                            : frameTimeNanos;
                     try {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                            releaseOutputBufferAtTimeLockedLollipop(codec, nextOutputBuffer, frameTimeNanos);
+                            releaseOutputBufferAtTimeLockedLollipop(codec, nextOutputBuffer, releaseTimeNs);
                         } else {
                             releaseOutputBufferRenderLocked(codec, nextOutputBuffer, true);
                         }
@@ -1576,7 +1872,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         if (activeWindowVideoStats != null) {
                             activeWindowVideoStats.totalFramesRendered++;
                         }
-                        if (adpfHintSession != null) {
+                        if (adpfHintSession != null && !submissionHintsSelected) {
                             adpfHintSession.reportActualWorkDuration(
                                     (System.nanoTime() - adpfStartNs) + lastDecodeDurationNs);
                         }
@@ -1706,6 +2002,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                     maybeReloadDecoderTimingPrefs();
                     // Drain async no-render releases here to avoid output backpressure and callback-thread binder calls.
                     drainAsyncNoRenderReleaseQueue();
+                    // Reset NanoPacer on this (owning) thread for display identity/rate changes
+                    maybeResetNanoPacerForDisplayChange();
 
                     // Timeout: 0 for immediate delivery, otherwise user-configurable wait
                     final int pacingMode = (prefs != null)
@@ -1853,8 +2151,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                                 final boolean useNanoPacer = (prefs != null && prefs.fastVsync);
 
                                 if (useNanoPacer) {
-                                    final float rrHz =
-                                            (refreshRateHz > 1f) ? refreshRateHz : ((refreshRate > 0) ? (float) refreshRate : 60f);
+                                    final float rrHz = getEffectiveDisplayRefreshRateHz();
                                     nanoPacer.updatePacingMode(
                                             true,
                                             MediaCodecDecoderRenderer.this.streamTargetFps,
@@ -1885,7 +2182,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
                                 activeWindowVideoStats.totalFramesRendered++;
 
-                                if (adpfHintSession != null) {
+                                if (adpfHintSession != null && !submissionHintsSelected) {
                                     adpfWorkNs += System.nanoTime() - adpfMarkNs;
                                     adpfHintSession.reportActualWorkDuration(
                                             adpfWorkNs + lastDecodeDurationNs);
@@ -1975,7 +2272,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         // Prefetched buffer fast path (validate invariant: buffer implies valid index)
-        if (nextInputBuffer != null) {
+        if (nextInputBuffer != null || (blockInputActive && nextInputBufferIndex >= 0)) {
             if (nextInputBufferIndex >= 0) {
                 inputTryAgainStreak = 0;
                 inputDequeueHangStartMs = 0L;
@@ -2025,7 +2322,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 inputTryAgainStreak = 0;
                 inputDequeueHangStartMs = 0L;
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                if (blockInputActive) {
+                    // Reserve only the callback slot. Allocate/map the actual payload at queue
+                    // time, never an oversized buffer or a speculative prefetched LinearBlock.
+                    nextInputBuffer = null;
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                     nextInputBuffer = codec.getInputBuffer(nextInputBufferIndex);
                     if (nextInputBuffer == null) {
                         final int badIndex = nextInputBufferIndex;
@@ -2116,7 +2417,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             LimeLog.warning("Dequeue input buffer ran long: " + (dtNs / 1_000_000L) + " ms");
         }
 
-        return nextInputBuffer != null;
+        return blockInputActive ? nextInputBufferIndex >= 0 : nextInputBuffer != null;
     }
 
     @Override
@@ -2182,6 +2483,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (adpfHintSession != null) {
             adpfHintSession.close();
         }
+        if (adpfSubmissionSession != null) {
+            adpfSubmissionSession.close();
+        }
+        adpfWorkerIdentity = null;
 
         // Halt the rendering thread
         if (rendererThread != null) {
@@ -2561,6 +2866,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     @Override
     public void cleanup() {
 
+        // Also covers failed setup where stop() was never called.
+        if (adpfHintSession != null) {
+            adpfHintSession.close();
+        }
+        if (adpfSubmissionSession != null) {
+            adpfSubmissionSession.close();
+        }
+        adpfWorkerIdentity = null;
+
         // Clear decode latency tracking to prevent memory leaks
         decodeLatencyTracker.clear();
         perfOverlayComposer.reset();
@@ -2633,12 +2947,21 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     }
 
     private boolean queueNextInputBuffer(long timestampUs, int codecFlags) {
+        return queueNextInputBuffer(timestampUs, codecFlags, null, 0);
+    }
+
+    private boolean queueNextInputBuffer(long timestampUs, int codecFlags, byte[] blockData, int blockLength) {
         boolean codecRecovered;
+        final boolean blockQueue = blockInputActive;
 
         try {
-            videoDecoder.queueInputBuffer(nextInputBufferIndex,
-                    0, nextInputBuffer.position(),
-                    timestampUs, codecFlags);
+            if (blockQueue) {
+                blockCodecInput.queue(videoDecoder, nextInputBufferIndex,
+                        blockData, blockLength, timestampUs, codecFlags);
+            } else {
+                videoDecoder.queueInputBuffer(nextInputBufferIndex,
+                        0, nextInputBuffer.position(), timestampUs, codecFlags);
+            }
 
             // Track enqueue time for this PTS
             if (timestampUs != 0) { // Don't track config buffers with timestamp 0
@@ -2653,8 +2976,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             // We need a new buffer now
             nextInputBufferIndex = -1;
             nextInputBuffer = null;
-        } catch (IllegalStateException e) {
-            if (handleDecoderException(e)) {
+        } catch (RuntimeException e) {
+            if (blockQueue) {
+                requestBlockInputFallback(e);
+                resetInputBufferState();
+            } else if (!(e instanceof IllegalStateException)) {
+                throw e;
+            } else if (handleDecoderException((IllegalStateException) e)) {
                 // Transient error: keep the buffer to avoid leaking it, and clear it for reuse.
                 if (nextInputBuffer != null) {
                     nextInputBuffer.clear();
@@ -3105,6 +3433,11 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             activeWindowVideoStats.totalTimeMs += enqueueTimeMs - receiveTimeMs;
         }
 
+        // Start after stats/overlay and codec-config submission. Include real input backpressure,
+        // but never add the unrelated output latency or deliberate presentation sleeps.
+        final long adpfGeneration = adpfCodecGeneration;
+        final long adpfWorkStartNs = startAdpfSubmissionWork();
+
         if (!fetchNextInputBuffer()) {
             return MoonBridge.DR_NEED_IDR;
         }
@@ -3115,7 +3448,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             codecFlags |= MediaCodec.BUFFER_FLAG_SYNC_FRAME;
 
             // If we are using fused IDR frames, submit the CSD with each IDR frame
-            if (coldCfg.fusedIdrFrame && !csdSubmittedForThisFrame) {
+            if (!blockInputActive && coldCfg.fusedIdrFrame && !csdSubmittedForThisFrame) {
                 int csdBytes = 0;
                 for (byte[] b : coldCfg.vpsBuffers) csdBytes += b.length;
                 for (byte[] b : coldCfg.spsBuffers) csdBytes += b.length;
@@ -3165,7 +3498,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
         numFramesIn++;
 
-        if (decodeUnitLength > nextInputBuffer.limit() - nextInputBuffer.position()) {
+        if (!blockInputActive && decodeUnitLength > nextInputBuffer.limit() - nextInputBuffer.position()) {
             IllegalArgumentException exception = new IllegalArgumentException(
                     "Decode unit length "+decodeUnitLength+" too large for input buffer "+nextInputBuffer.limit());
             if (!coldCfg.reportedCrash) {
@@ -3176,13 +3509,31 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         // Copy data from our buffer list into the input buffer
-        nextInputBuffer.put(decodeUnitData, 0, decodeUnitLength);
+        if (!blockInputActive) {
+            nextInputBuffer.put(decodeUnitData, 0, decodeUnitLength);
+        }
 
-        if (!queueNextInputBuffer(timestampUs, codecFlags)) {
+        if (!queueNextInputBuffer(timestampUs, codecFlags, decodeUnitData, decodeUnitLength)) {
             return MoonBridge.DR_NEED_IDR;
         }
 
+        if (adpfWorkStartNs != 0L && adpfGeneration == adpfCodecGeneration) {
+            adpfSubmissionSession.reportWorkDuration(System.nanoTime() - adpfWorkStartNs);
+        }
+
         return MoonBridge.DR_OK;
+    }
+
+    private long startAdpfSubmissionWork() {
+        final AdpfSubmissionSession hint = adpfSubmissionSession;
+        if (stopping || hint == null || hint.isDisabled()) {
+            return 0L;
+        }
+        final CodecThreadDiscovery.WorkerIdentity worker =
+                getEffectivePacingForThreadPriorities() == PreferenceConfiguration.FRAME_PACING_BALANCED
+                        ? adpfWorkerIdentity : null;
+        hint.ensureConfigured(Process.myTid(), worker);
+        return hint.isActive() ? System.nanoTime() : 0L;
     }
 
     private boolean replaySps() {
@@ -3510,6 +3861,10 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         public void onCodecError(MediaCodec codec, MediaCodec.CodecException e) {
             try {
                 LimeLog.warning("[Video] MediaCodec async error: " + e);
+                if (blockInputActive) {
+                    if (codec == videoDecoder) requestBlockInputFallback(e);
+                    return;
+                }
                 if (!handleDecoderException(e)) {
                     LimeLog.info("Async error queued for recovery");
                 }
@@ -3583,6 +3938,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     public String getAsyncDecodingStatus() {
         return "AsyncDecoding: " + (useAsyncCodec ? "ENABLED" : "DISABLED") +
+                " (input=" + (blockInputActive ? "block" : "legacy") + ")" +
                 " (API " + Build.VERSION.SDK_INT +
                 ", callbackThread=" + (asyncCodec.isActive() ? "alive" : "null") +
                 ", inputQueue=" + asyncCodec.getInputQueueSize() +
@@ -3669,7 +4025,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         // Validate invariant: buffer implies valid index.
-        if (nextInputBuffer != null) {
+        if (nextInputBuffer != null || (blockInputActive && nextInputBufferIndex >= 0)) {
             if (nextInputBufferIndex >= 0) {
                 return true;
             }
@@ -3704,7 +4060,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 inputTryAgainStreak = 0;
                 inputDequeueHangStartMs = 0L;
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                if (blockInputActive) {
+                    nextInputBuffer = null; // Slot-only prefetch; no LinearBlock allocation.
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
                     nextInputBuffer = codec.getInputBuffer(nextInputBufferIndex);
                     if (nextInputBuffer == null) {
                         final int badIndex = nextInputBufferIndex;
@@ -3761,8 +4119,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         final PreferenceConfiguration p = prefs;
 
         final float wantedFps =
-                (p != null && p.fps > 0) ? (float) p.fps :
-                        ((refreshRateHz > 1f) ? refreshRateHz : ((refreshRate > 0) ? (float) refreshRate : 60f));
+                (p != null && p.fps > 0) ? (float) p.fps : getEffectiveDisplayRefreshRateHz();
 
         final boolean immediate = (p != null && p.immediateFrameDelivery);
 
@@ -3793,6 +4150,13 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     /** ADPF hint session for the video threads; null when unsupported. See {@link AdpfHintSession}. */
     private final AdpfHintSession adpfHintSession;
+
+    // Separate opt-in submission policy; preserves the default rendering policy elsewhere.
+    private volatile boolean submissionHintsSelected;
+    private AdpfSubmissionSession adpfSubmissionSession;
+    private CodecThreadDiscovery adpfThreadDiscovery;
+    private volatile CodecThreadDiscovery.WorkerIdentity adpfWorkerIdentity;
+    private volatile long adpfCodecGeneration;
 
     /**
      * Most recent decoder latency (input enqueue -> output dequeue), in nanoseconds.
@@ -3878,7 +4242,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
      */
     private void applyAdpfHint() {
         final AdpfHintSession hint = adpfHintSession;
-        if (hint == null) {
+        if (hint == null || submissionHintsSelected || stopping) {
             return;
         }
 

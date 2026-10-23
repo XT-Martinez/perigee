@@ -22,6 +22,7 @@ import android.media.MediaCodecInfo.CodecProfileLevel;
 import android.media.MediaFormat;
 import android.os.Build;
 
+import com.limelight.BuildConfig;
 import com.limelight.LimeLog;
 import com.limelight.preferences.PreferenceConfiguration;
 
@@ -534,11 +535,113 @@ public class MediaCodecHelper {
                 ) && !isAdreno620;
     }
 
+    /**
+     * EXPERIMENT (compile-time opt-in): writes the same AV1 operating-rate 240 hint the Nova companion
+     * uses on the Pixel 9a, so Artemide can be compared before and after changing
+     * this one codec hint while its stream preferences remain fixed.
+     *
+     * <p>Scope: <b>every Google c2 AV1 stream on the Pixel 9a in an opted-in build, SDR and HDR
+     * alike.</b> The gate is the AV1 MIME plus the decoder name and device, not the stream's
+     * dynamic range, so this hint is also added to SDR AV1 streams. It only adds a codec
+     * resource-planning key: no HDR metadata, colorspace/dataspace, transfer, or range handling is
+     * read or written, and the HDR color path is untouched. H.264/HEVC streams, other AV1
+     * decoders, other devices and builds without the compile-time gate are unaffected.
+     *
+     * <p>Compile-time gated by {@link BuildConfig#AV1_OPERATING_RATE_240}.
+     *
+     * <p>The key is written with {@code setFloat}: {@code MediaCodec} reads it via
+     * {@code findFloat("operating-rate", ...)} and Nova's working configuration uses a float as
+     * well. The return value is deliberately not folded into {@code setNewOption}: the hint is a
+     * modifier of the low-latency set, not an independent retry option. Reporting it as one would
+     * keep the caller's {@code newFormat} true past the real option set, so the loop would never
+     * reach its terminal (hint-free) attempt and could not terminate on a persistently failing
+     * decoder.
+     *
+     * @return true when the hint was written
+     */
+    private static boolean applyAv1OperatingRate240Hint(MediaFormat videoFormat, MediaCodecInfo decoderInfo) {
+        if (!isAv1OperatingRate240HintApplicable(videoFormat, decoderInfo)) {
+            return false;
+        }
+
+        try {
+            videoFormat.setFloat(MediaFormat.KEY_OPERATING_RATE, 240f);
+            LimeLog.info("EXPERIMENT: AV1 operating-rate 240 hint applied to " + decoderInfo.getName());
+            return true;
+        } catch (Throwable t) {
+            LimeLog.warning("EXPERIMENT: AV1 operating-rate 240 hint rejected: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * Whether {@link #applyAv1OperatingRate240Hint} would attach the hint to this format. Used by
+     * the decoder configuration loop to decide whether a hint-free retry is worth making; states
+     * the scope in one place (all Google c2 AV1 streams on the Pixel 9a, SDR and HDR alike, in a
+     * compile-time opted-in builds only).
+     */
+    static boolean isAv1OperatingRate240HintApplicable(MediaFormat videoFormat, MediaCodecInfo decoderInfo) {
+        if (videoFormat == null || decoderInfo == null) {
+            return false;
+        }
+
+        String mime = null;
+        try {
+            mime = videoFormat.getString(MediaFormat.KEY_MIME);
+        } catch (Throwable ignored) {
+        }
+
+        return shouldApplyAv1OperatingRate240Hint(
+                BuildConfig.AV1_OPERATING_RATE_240,
+                mime,
+                decoderInfo.getName(),
+                Build.DEVICE,
+                Build.PRODUCT,
+                Build.MODEL);
+    }
+
+    /**
+     * Pure decision for the experiment, split out so its scope (AV1 + Google c2 + Pixel 9a) can be
+     * unit tested independently of the compile-time gate.
+     */
+    static boolean shouldApplyAv1OperatingRate240Hint(boolean enabled, String mime, String decoderName,
+                                                      String device, String product, String model) {
+        if (!enabled || mime == null || decoderName == null) {
+            return false;
+        }
+        if (!"video/av01".equals(mime)) {
+            return false;
+        }
+        if (!decoderName.toLowerCase(Locale.US).startsWith("c2.google.av1")) {
+            return false;
+        }
+        return "tegu".equalsIgnoreCase(device)
+                || "tegu".equalsIgnoreCase(product)
+                || "Pixel 9a".equalsIgnoreCase(model);
+    }
+
     public static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int streamFps, int tryNumber) {
+        return setDecoderLowLatencyOptions(videoFormat, decoderInfo, ultraLowLatency, streamFps, tryNumber, true);
+    }
+
+    /**
+     * As above, but the experimental AV1 operating-rate 240 hint can be suppressed. The decoder
+     * configuration loop uses this once, on its terminal attempt, to retry with the exact perf
+     * format if a decoder rejects the experimental hint.
+     */
+    static boolean setDecoderLowLatencyOptions(MediaFormat videoFormat, MediaCodecInfo decoderInfo, boolean ultraLowLatency, int streamFps, int tryNumber, boolean applyAv1OperatingRateHint) {
         // Options here should be tried in the order of most to least risky. The decoder will use
         // the first MediaFormat that doesn't fail in configure().
 
         boolean setNewOption = false;
+
+        // EXPERIMENT: Pixel 9a AV1 operating-rate 240 hint (compile-time gated, see BuildConfig).
+        // Applied before every branch below so that each fallback configuration attempt - which
+        // rebuilds the MediaFormat and re-enters this method - keeps the hint instead of
+        // silently losing it. The terminal hint-free retry in the caller passes false here.
+        if (applyAv1OperatingRateHint) {
+            applyAv1OperatingRate240Hint(videoFormat, decoderInfo);
+        }
 
         // --- MTK Pentonic TV preset (mt5896 / TCL G08, AU04 firmware) ---
         // Unlike the generic MTK branch below, this uses only keys that actually exist in the

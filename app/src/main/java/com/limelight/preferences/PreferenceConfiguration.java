@@ -405,6 +405,8 @@ public class PreferenceConfiguration {
 
     // TCL/MediaTek Game picture/audio mode for the duration of a stream (see TclGameModeProfile)
     public boolean tclGameModeProfile;
+    // Opt-in replacement of rendering hints with Pixel 9a/Google AV1 submission hints.
+    public boolean enableAdpfHint;
     // Vsync settings
     public boolean enableVsync = false;
 
@@ -1187,6 +1189,7 @@ public class PreferenceConfiguration {
         config.preventPacketLoss = prefs.getBoolean(PREVENT_PACKET_LOSS_PREF_STRING, DEFAULT_PREVENT_PACKET_LOSS);
         config.snappyInput = prefs.getBoolean(SNAPPY_INPUT_PREF_STRING, DEFAULT_SNAPPY_INPUT);
         config.immediateFrameDelivery = prefs.getBoolean(IMMEDIATE_FRAME_DELIVERY_PREF_STRING, DEFAULT_IMMEDIATE_FRAME_DELIVERY);
+        config.enableAdpfHint = prefs.getBoolean("checkbox_adpf_hint", false);
         config.asyncDecodeEnabled = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) && prefs.getBoolean(ASYNC_DECODE_ENABLED_PREF_STRING, DEFAULT_ASYNC_DECODE_ENABLED);
         config.syncLfrEnabled = prefs.getBoolean(SYNC_LFR_ENABLED_PREF_STRING, DEFAULT_SYNC_LFR_ENABLED);
         config.decoderOutputDequeueTimeoutCustom = prefs.getBoolean(

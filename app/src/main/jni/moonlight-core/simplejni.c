@@ -159,12 +159,16 @@ Java_com_limelight_nvstream_jni_MoonBridge_findExternalAddressIP4(JNIEnv *env, j
 
         inet_ntop(AF_INET, &wanAddr, addrStr, sizeof(addrStr));
 
+#ifndef ARTEMIDE_NO_LOGGING
         __android_log_print(ANDROID_LOG_INFO, "moonlight-common-c", "Resolved WAN address to %s", addrStr);
+#endif
 
         return (*env)->NewStringUTF(env, addrStr);
     }
     else {
+#ifndef ARTEMIDE_NO_LOGGING
         __android_log_print(ANDROID_LOG_ERROR, "moonlight-common-c", "STUN failed to get WAN address: %d", err);
+#endif
         return NULL;
     }
 }

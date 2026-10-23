@@ -14,6 +14,27 @@ android {
         versionName "Experimental_Async_0.5.1"
         versionCode = 57
 
+        // EXPERIMENT: AV1 operating-rate 240 decoder hint for the Pixel 9a A/B. Compile-time
+        // gated off by default. perfDebug enables it; optimized perf can opt in explicitly
+        // with -Pav1OperatingRateExperiment=true, without enabling other perfDebug changes.
+        buildConfigField "boolean", "AV1_OPERATING_RATE_240", "false"
+        // A/B: subtract Display.getAppVsyncOffsetNanos() from the Balanced presentation
+        // timestamp (Nova's release convention). Off in every build type except perfDebug.
+        buildConfigField "boolean", "BALANCED_SUBTRACT_APP_VSYNC_OFFSET", "false"
+        // Opt-in Pixel 9a/Google AV1 submission hints; no change to the default rendering hints.
+        buildConfigField "boolean", "ADPF_TWO_THREAD_EXPERIMENT", "true"
+        // Isolated 1 ms submission-budget experiment. Pixel 9a captures on 2026-10-01:
+        // reported submission mean 0.99 -> 0.82-0.85 ms, but codec queue-to-completion
+        // 4.24 -> 4.19-4.33 ms (no demonstrated decoding-latency improvement). Genuine
+        // work accounting and thread membership are unchanged; target is not a proven optimum.
+        buildConfigField "int", "ADPF_SUBMIT_TARGET_NS", "1000000"
+        // Diagnostic builds may log; the optimized Artemide build strips all app logging.
+        buildConfigField "boolean", "LOG_ENABLED", "true"
+        // Off by default. The optimized perf A/B can opt in with -Pav1BlockInputExperiment=true.
+        // Runtime scope also requires Pixel 9a/Google AV1, ADPF opt-in, async, Balanced, <=1080p,
+        // and no GL upscaling. ADPF target/thread membership and decoder options stay unchanged.
+        buildConfigField "boolean", "AV1_BLOCK_INPUT_EXPERIMENT", "false"
+
         // Generate native debug symbols to allow Google Play to symbolicate our native crashes
         ndk.debugSymbolLevel = 'FULL'
     }
@@ -156,18 +177,52 @@ perf {
     resValue "string", "app_label_root", "Artemide (Root)"
     resValue "string", "app_label_game", "Artemide (Game)"
     buildConfigField "boolean", "LOG_VERBOSE", "false"
+    buildConfigField "boolean", "LOG_ENABLED", "false"
+    proguardFile 'proguard-clean.pro'
+    buildConfigField "boolean", "AV1_OPERATING_RATE_240",
+            (project.findProperty("av1OperatingRateExperiment") == "true").toString()
+    buildConfigField "boolean", "AV1_BLOCK_INPUT_EXPERIMENT",
+            (project.findProperty("av1BlockInputExperiment") == "true").toString()
 
     // Make sure native is optimized (no debug NDK)
     externalNativeBuild {
         //-03 thinlto
         ndkBuild {
             // Enable perf path and *release* optimizations
-            arguments "APP_PERF:=1", "APP_OPTIM:=release", "NDK_DEBUG=0"
+            arguments "APP_PERF:=1", "APP_OPTIM:=release", "NDK_DEBUG=0", "APP_LOGGING=0"
             // per provare Full LTO:   add "APP_LTO_FULL=1"
             // per provare NO  LTO:    add "APP_LTO_NONE=1"
         }
     }
 }
+        // Separate debuggable companion to the optimized perf build. Its own package ID
+        // preserves the installed perf app and its private data, while the inherited
+        // native build arguments keep the same release-optimized decoder path.
+        perfDebug {
+            initWith perf
+            matchingFallbacks = ["perf", "release"]
+            applicationIdSuffix ".perfdebug"
+            resValue "string", "app_label", "Artemide Debug"
+            resValue "string", "app_label_root", "Artemide Debug (Root)"
+            resValue "string", "app_label_game", "Artemide Debug (Game)"
+            debuggable true
+            minifyEnabled false
+            shrinkResources false
+            buildConfigField "boolean", "LOG_VERBOSE", "true"
+            buildConfigField "boolean", "LOG_ENABLED", "true"
+            // Keep logging in the debug companion only.
+            proguardFiles = [getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro']
+            externalNativeBuild {
+                ndkBuild {
+                    arguments "APP_LOGGING=1"
+                }
+            }
+            // The debug companion enables the hint regardless of the perf opt-in property.
+            buildConfigField "boolean", "AV1_OPERATING_RATE_240", "true"
+            // A/B: subtract Display.getAppVsyncOffsetNanos() from the Balanced presentation
+            // timestamp so Artemis matches Nova's release convention.
+            buildConfigField "boolean", "BALANCED_SUBTRACT_APP_VSYNC_OFFSET", "true"
+        }
     }
 
     externalNativeBuild {

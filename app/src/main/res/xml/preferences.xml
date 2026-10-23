@@ -60,6 +60,12 @@
             app:iconSpaceReserved="false" />
 
         <!--Vsync -->
+        <CheckBoxPreference
+            android:defaultValue="false"
+            android:key="checkbox_adpf_hint"
+            android:summary="@string/summary_checkbox_adpf_hint"
+            android:title="@string/title_checkbox_adpf_hint"
+            app:iconSpaceReserved="false" />
         <!--fastVsync -->
         <!-- Video Upscaling (FSR-like) -->
         <CheckBoxPreference

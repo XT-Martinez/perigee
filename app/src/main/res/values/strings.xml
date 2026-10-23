@@ -879,4 +879,6 @@
         <item>prime_little</item>
     </string-array>
 
+    <string name="title_checkbox_adpf_hint">ADPF submission hints (Experimental)</string>
+    <string name="summary_checkbox_adpf_hint">Pixel 9a with Google AV1 only. Replaces the default rendering hints with measured app-side submission hints and, in Balanced mode, the app-owned codec worker. Off keeps Artemide\'s default hints. Applies next stream start. No guaranteed latency gain; external decoder-service threads cannot be hinted.</string>
 </resources>

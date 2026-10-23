@@ -163,6 +163,7 @@ final class AdpfHintSession {
 
     /** Releases the session. Safe to call repeatedly and after {@link #create} returned a no-op. */
     synchronized void close() {
+        unavailable = true; // Do not let late priority updates resurrect a stopped session.
         closeSession();
         threadIds = new int[0];
         targetDurationNs = 0;
