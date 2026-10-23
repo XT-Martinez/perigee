@@ -489,9 +489,9 @@
     <string name="summary_share_performance_logs">Share your performance with friends or the community</string>
     <string name="title_share_performance_logs_button">Share Performance Logs</string>
     <string name="title_software_update">Software Update</string>
-    <string name="summary_software_update">Artemis Nior Version by ClassicOldSong - Visit GitHub Releases to get latest version</string>
+    <string name="summary_software_update">Perigee by XT-Martinez, based on Artemide/Artemis - Visit GitHub Releases to get latest version</string>
     <string name="title_follow_update">Follow Update</string>
-    <string name="summary_follow_update">Follow updates of Artemis with Obtainium</string>
+    <string name="summary_follow_update">Follow updates of Perigee with Obtainium</string>
     <string name="title_special_key_layout">Special Key Layout</string>
     <string name="title_show_virtual_key">Display virtual keys on screen</string>
     <string name="summary_show_virtual_key">Display a layer of virtual special keys on the touchscreen.\nKey opacity is shared with the virtual gamepad above.</string>
@@ -880,5 +880,5 @@
     </string-array>
 
     <string name="title_checkbox_adpf_hint">ADPF submission hints (Experimental)</string>
-    <string name="summary_checkbox_adpf_hint">Pixel 9a with Google AV1 only. Replaces the default rendering hints with measured app-side submission hints and, in Balanced mode, the app-owned codec worker. Off keeps Artemide\'s default hints. Applies next stream start. No guaranteed latency gain; external decoder-service threads cannot be hinted.</string>
+    <string name="summary_checkbox_adpf_hint">Pixel 9a with Google AV1 only. Replaces the default rendering hints with measured app-side submission hints and, in Balanced mode, the app-owned codec worker. Off keeps the default hints. Applies next stream start. No guaranteed latency gain; external decoder-service threads cannot be hinted.</string>
 </resources>

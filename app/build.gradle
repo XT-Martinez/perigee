@@ -1,5 +1,12 @@
 apply plugin: 'com.android.application'
 
+// Release signing secrets live outside version control (see keystore.properties.example).
+def releaseKeystoreFile = rootProject.file('keystore.properties')
+def releaseKeystore = new Properties()
+if (releaseKeystoreFile.exists()) {
+    releaseKeystoreFile.withInputStream { releaseKeystore.load(it) }
+}
+
 android {
     ndkVersion "27.0.12077973"
 
@@ -11,8 +18,8 @@ android {
         minSdk 21
         targetSdk 34
 
-        versionName "Experimental_Async_0.5.1"
-        versionCode = 57
+        versionName "1.0.0"
+        versionCode = 100
 
         // EXPERIMENT: AV1 operating-rate 240 decoder hint for the Pixel 9a A/B. Compile-time
         // gated off by default. perfDebug enables it; optimized perf can opt in explicitly
@@ -28,7 +35,7 @@ android {
         // 4.24 -> 4.19-4.33 ms (no demonstrated decoding-latency improvement). Genuine
         // work accounting and thread membership are unchanged; target is not a proven optimum.
         buildConfigField "int", "ADPF_SUBMIT_TARGET_NS", "1000000"
-        // Diagnostic builds may log; the optimized Artemide build strips all app logging.
+        // Diagnostic builds may log; the optimized Perigee build strips all app logging.
         buildConfigField "boolean", "LOG_ENABLED", "true"
         // Off by default. The optimized perf A/B can opt in with -Pav1BlockInputExperiment=true.
         // Runtime scope also requires Pixel 9a/Google AV1, ADPF opt-in, async, Balanced, <=1080p,
@@ -37,6 +44,17 @@ android {
 
         // Generate native debug symbols to allow Google Play to symbolicate our native crashes
         ndk.debugSymbolLevel = 'FULL'
+    }
+
+    signingConfigs {
+        release {
+            if (releaseKeystoreFile.exists()) {
+                storeFile rootProject.file(releaseKeystore['storeFile'])
+                storePassword releaseKeystore['storePassword']
+                keyAlias releaseKeystore['keyAlias']
+                keyPassword releaseKeystore['keyPassword']
+            }
+        }
     }
 
     flavorDimensions.add("root")
@@ -61,7 +79,7 @@ android {
                     "obtainium_app_url",
                     "data:text/html;base64,PGgxPlJvb3QgYnVpbGQgaXMgbm90IGF2YWlsYWJsZTwvaDE+"
 
-            applicationId "com.limelight.root"
+            applicationId "io.github.xtmartinez.perigee.root"
             dimension "root"
             buildConfigField "boolean", "ROOT_BUILD", "true"
         }
@@ -75,9 +93,9 @@ android {
 
             resValue "string",
                     "obtainium_app_url",
-                    "https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22com.limelight.noir%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2FClassicOldSong%2Fmoonlight-android%22%2C%22author%22%3A%22ClassicOldSong%22%2C%22name%22%3A%22Artemis%22%2C%22additionalSettings%22%3A%22%7B%5C%22apkFilterRegEx%5C%22%3A%5C%22nonRoot%5C%22%2C%5C%22matchGroutToUse%5C%22%3A%5C%22%241%5C%22%2C%5C%22versionExtractionRegEx%5C%22%3A%5C%22v(.%2B)%5C%22%7D%22%7D"
+                    "https://apps.obtainium.imranr.dev/redirect?r=obtainium://app/%7B%22id%22%3A%22io.github.xtmartinez.perigee%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2FXT-Martinez%2Fperigee%22%2C%22author%22%3A%22XT-Martinez%22%2C%22name%22%3A%22Perigee%22%2C%22additionalSettings%22%3A%22%7B%5C%22apkFilterRegEx%5C%22%3A%5C%22nonRoot%5C%22%2C%5C%22matchGroupToUse%5C%22%3A%5C%22%241%5C%22%2C%5C%22versionExtractionRegEx%5C%22%3A%5C%22v(.%2B)%5C%22%7D%22%7D"
 
-            applicationId "com.limelight"
+            applicationId "io.github.xtmartinez.perigee"
             dimension "root"
             buildConfigField "boolean", "ROOT_BUILD", "false"
         }
@@ -116,10 +134,10 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix ".noirdebug"
-            resValue "string", "app_label", "Diana"
-            resValue "string", "app_label_root", "Diana (Root)"
-            resValue "string", "app_label_game", "Diana (Game)"
+            applicationIdSuffix ".debug"
+            resValue "string", "app_label", "Perigee Debug"
+            resValue "string", "app_label_root", "Perigee Debug (Root)"
+            resValue "string", "app_label_game", "Perigee Debug (Game)"
 
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
@@ -156,10 +174,10 @@ android {
             // is to please change the applicationId before you publish.
             //
             // TL;DR: Leave the following line alone!
-            applicationIdSuffix ".noir"
-            resValue "string", "app_label", "Artemis"
-            resValue "string", "app_label_root", "Artemis (Root)"
-            resValue "string", "app_label_game", "Artemis (Game)"
+            applicationIdSuffix ".release"
+            resValue "string", "app_label", "Perigee"
+            resValue "string", "app_label_root", "Perigee (Root)"
+            resValue "string", "app_label_game", "Perigee (Game)"
 
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
@@ -171,11 +189,14 @@ perf {
     debuggable false
     minifyEnabled true
     shrinkResources true
-    signingConfig signingConfigs.debug
-    applicationIdSuffix ".perf"
-    resValue "string", "app_label", "Artemide"
-    resValue "string", "app_label_root", "Artemide (Root)"
-    resValue "string", "app_label_game", "Artemide (Game)"
+    // Published APKs are signed with the release key when keystore.properties is present;
+    // local builds without it fall back to the debug key.
+    signingConfig releaseKeystoreFile.exists() ? signingConfigs.release : signingConfigs.debug
+    // The published build: no suffix, so it installs as the plain Perigee package.
+    applicationIdSuffix ""
+    resValue "string", "app_label", "Perigee"
+    resValue "string", "app_label_root", "Perigee (Root)"
+    resValue "string", "app_label_game", "Perigee (Game)"
     buildConfigField "boolean", "LOG_VERBOSE", "false"
     buildConfigField "boolean", "LOG_ENABLED", "false"
     proguardFile 'proguard-clean.pro'
@@ -202,9 +223,9 @@ perf {
             initWith perf
             matchingFallbacks = ["perf", "release"]
             applicationIdSuffix ".perfdebug"
-            resValue "string", "app_label", "Artemide Debug"
-            resValue "string", "app_label_root", "Artemide Debug (Root)"
-            resValue "string", "app_label_game", "Artemide Debug (Game)"
+            resValue "string", "app_label", "Perigee Debug"
+            resValue "string", "app_label_root", "Perigee Debug (Root)"
+            resValue "string", "app_label_game", "Perigee Debug (Game)"
             debuggable true
             minifyEnabled false
             shrinkResources false
@@ -220,7 +241,7 @@ perf {
             // The debug companion enables the hint regardless of the perf opt-in property.
             buildConfigField "boolean", "AV1_OPERATING_RATE_240", "true"
             // A/B: subtract Display.getAppVsyncOffsetNanos() from the Balanced presentation
-            // timestamp so Artemis matches Nova's release convention.
+            // timestamp so Perigee matches Nova's release convention.
             buildConfigField "boolean", "BALANCED_SUBTRACT_APP_VSYNC_OFFSET", "true"
         }
     }
