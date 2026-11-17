@@ -3,7 +3,6 @@ package com.limelight.binding.video;
 import android.os.PerformanceHintManager;
 
 import com.limelight.BuildConfig;
-import com.limelight.preferences.PreferenceConfiguration;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -21,10 +20,6 @@ import static org.mockito.Mockito.*;
 @Config(sdk = 33)
 @RunWith(RobolectricTestRunner.class)
 public class AdpfSubmissionSessionTest {
-    private static CodecThreadDiscovery.WorkerIdentity worker(int tid, long start) {
-        return new CodecThreadDiscovery.WorkerIdentity(tid, start);
-    }
-
     private static AdpfSubmissionSession session(FakeFactory factory) {
         return new AdpfSubmissionSession(factory, AdpfSubmissionSession.TARGET_NS);
     }
@@ -85,24 +80,25 @@ public class AdpfSubmissionSessionTest {
     }
 
     @Test
-    public void twoThreadSessionNormalizesOrderAndIgnoresEquivalentIdentity() {
+    public void twoThreadSessionNormalizesOrderAndIgnoresEqualContent() {
         FakeFactory f = new FakeFactory();
         AdpfSubmissionSession s = session(f);
-        s.ensureConfigured(42, worker(7, 100));
-        s.ensureConfigured(42, worker(7, 100));
+        s.ensureConfigured(42, new int[] {7});
+        s.ensureConfigured(42, new int[] {7});
         assertEquals(1, f.calls);
         assertArrayEquals(new int[] {7, 42}, f.tids);
     }
 
     @Test
-    public void invalidDuplicateOrUnverifiableWorkerKeepsInputOnly() {
+    public void invalidDuplicateOrNonPositiveExtrasAreDropped() {
         FakeFactory f = new FakeFactory();
         AdpfSubmissionSession s = session(f);
-        s.ensureConfigured(7, worker(7, 100));
-        s.ensureConfigured(7, worker(42, 0));
-        s.ensureConfigured(7, worker(-1, 100));
+        s.ensureConfigured(7, new int[] {7, 0, -1});
         assertEquals(1, f.calls);
         assertArrayEquals(new int[] {7}, f.tids);
+        s.ensureConfigured(7, new int[] {42, 42, 0});
+        assertEquals(2, f.calls);
+        assertArrayEquals(new int[] {7, 42}, f.tids);
     }
 
     @Test
@@ -110,11 +106,42 @@ public class AdpfSubmissionSessionTest {
         FakeFactory f = new FakeFactory();
         f.unsupported = true;
         AdpfSubmissionSession s = session(f);
-        s.ensureConfigured(7, worker(42, 100));
+        s.ensureConfigured(7, new int[] {42});
         s.ensureConfigured(7, null);
         assertTrue(s.isDisabled());
         assertFalse(s.isActive());
-        assertEquals(1, f.calls);
+        // Null with extras may only mean a refused tid, so input-only is tried before latching.
+        assertEquals(2, f.calls);
+    }
+
+    @Test
+    public void nullForTheExtraSetFallsBackToInputOnlyInsteadOfDisabling() {
+        FakeFactory f = new FakeFactory();
+        f.nullForExtras = true;
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {42, 50});
+        assertFalse(s.isDisabled());
+        assertTrue(s.isActive());
+        assertEquals(2, f.calls);
+        assertArrayEquals(new int[] {7}, f.tids);
+        for (int i = 0; i < 100; i++) {
+            s.ensureConfigured(7, new int[] {42, 50});
+        }
+        assertEquals(2, f.calls);
+    }
+
+    @Test
+    public void droppingAllExtrasForgetsTheRejectedSet() {
+        FakeFactory f = new FakeFactory();
+        f.rejectWorker = true;
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {42});
+        assertEquals(2, f.calls);
+        s.ensureConfigured(7, null);
+        f.rejectWorker = false;
+        s.ensureConfigured(7, new int[] {42});
+        assertEquals(3, f.calls);
+        assertArrayEquals(new int[] {7, 42}, f.tids);
     }
 
     @Test
@@ -129,21 +156,23 @@ public class AdpfSubmissionSessionTest {
     }
 
     @Test
-    public void rejectedWorkerFallsBackWithoutPerFrameRetries() {
+    public void rejectedExtrasFallBackWithoutPerFrameRetries() {
         FakeFactory f = new FakeFactory();
         f.rejectWorker = true;
         AdpfSubmissionSession s = session(f);
-        s.ensureConfigured(7, worker(42, 100));
+        s.ensureConfigured(7, new int[] {42});
         assertTrue(s.isActive());
         assertFalse(s.isDisabled());
         assertArrayEquals(new int[] {7}, f.tids);
         for (int i = 0; i < 100; i++) {
-            s.ensureConfigured(7, worker(42, 100));
+            s.ensureConfigured(7, new int[] {42});
         }
         assertEquals(2, f.calls);
-        // TID reuse with a new kernel start token is a genuinely different identity.
-        s.ensureConfigured(7, worker(42, 200));
+        // A different extra set is genuinely new and is attempted once, then falls back again.
+        s.ensureConfigured(7, new int[] {42, 50});
         assertEquals(4, f.calls);
+        assertArrayEquals(new int[] {7}, f.tids);
+        assertTrue(s.isActive());
     }
 
     @Test
@@ -151,8 +180,8 @@ public class AdpfSubmissionSessionTest {
         FakeFactory f = new FakeFactory();
         f.rejectAll = true;
         AdpfSubmissionSession s = session(f);
-        s.ensureConfigured(7, worker(42, 100));
-        s.ensureConfigured(7, worker(43, 200));
+        s.ensureConfigured(7, new int[] {42});
+        s.ensureConfigured(7, new int[] {43});
         assertTrue(s.isDisabled());
         assertEquals(2, f.calls);
     }
@@ -196,7 +225,7 @@ public class AdpfSubmissionSessionTest {
         assertTrue(s.isDisabled());
         assertTrue(f.latest().closed);
         assertFalse(s.reportWorkDuration(1_000_000L));
-        s.ensureConfigured(7, worker(42, 100));
+        s.ensureConfigured(7, new int[] {42});
         assertEquals(1, f.calls);
     }
 
@@ -219,11 +248,11 @@ public class AdpfSubmissionSessionTest {
         FakeFactory f = new FakeFactory();
         AdpfSubmissionSession s = session(f);
         s.ensureConfigured(7, null);
-        s.ensureConfigured(7, worker(42, 100));
+        s.ensureConfigured(7, new int[] {42});
         assertEquals(2, f.calls);
         assertTrue(f.handles.get(0).closed);
         assertArrayEquals(new int[] {7, 42}, f.tids);
-        s.clearWorker();
+        s.clearExtraThreads();
         assertEquals(3, f.calls);
         assertTrue(f.handles.get(1).closed);
         assertArrayEquals(new int[] {7}, f.tids);
@@ -235,7 +264,7 @@ public class AdpfSubmissionSessionTest {
         FakeFactory f = new FakeFactory();
         AdpfSubmissionSession s = session(f);
         s.ensureConfigured(7, null);
-        s.ensureConfigured(7, worker(42, 100));
+        s.ensureConfigured(7, new int[] {42});
         assertEquals(1, f.calls);
         assertEquals(1, f.latest().updates);
         assertArrayEquals(new int[] {7, 42}, f.latest().updatedTids);
@@ -243,15 +272,15 @@ public class AdpfSubmissionSessionTest {
 
     @Test
     @Config(sdk = 34)
-    public void api34RejectedUpdateFallsBackAndLatchesWorkerIdentity() {
+    public void api34RejectedUpdateFallsBackAndLatchesExtraSet() {
         FakeFactory f = new FakeFactory();
         AdpfSubmissionSession s = session(f);
         s.ensureConfigured(7, null);
         FakeHandle old = f.latest();
         old.rejectUpdate = true;
-        s.ensureConfigured(7, worker(42, 100));
+        s.ensureConfigured(7, new int[] {42});
         for (int i = 0; i < 100; i++) {
-            s.ensureConfigured(7, worker(42, 100));
+            s.ensureConfigured(7, new int[] {42});
         }
         assertTrue(old.closed);
         assertEquals(1, old.updates);
@@ -261,35 +290,14 @@ public class AdpfSubmissionSessionTest {
     }
 
     @Test
-    public void clearWorkerAllowsRejectedIdentityToBeTriedAfterRecovery() {
+    public void clearExtraThreadsAllowsRejectedSetToBeTriedAgain() {
         FakeFactory f = new FakeFactory();
         f.rejectWorker = true;
         AdpfSubmissionSession s = session(f);
-        s.ensureConfigured(7, worker(42, 100));
-        s.clearWorker();
-        s.ensureConfigured(7, worker(42, 100));
+        s.ensureConfigured(7, new int[] {42});
+        s.clearExtraThreads();
+        s.ensureConfigured(7, new int[] {42});
         assertEquals(4, f.calls);
-    }
-
-    @Test
-    public void rendererStartsInputCycleWithWorkerOnlyInBalancedMode() throws Exception {
-        FakeFactory f = new FakeFactory();
-        AdpfSubmissionSession s = session(f);
-        MediaCodecDecoderRenderer renderer = mock(MediaCodecDecoderRenderer.class, CALLS_REAL_METHODS);
-        PreferenceConfiguration prefs = new PreferenceConfiguration();
-        prefs.framePacing = PreferenceConfiguration.FRAME_PACING_BALANCED;
-        set(renderer, "prefs", prefs);
-        set(renderer, "adpfSubmissionSession", s);
-        set(renderer, "adpfWorkerIdentity", worker(99999, 100));
-        Method start = MediaCodecDecoderRenderer.class.getDeclaredMethod("startAdpfSubmissionWork");
-        start.setAccessible(true);
-        assertTrue((long) start.invoke(renderer) > 0L);
-        assertEquals(2, f.tids.length);
-        prefs.framePacing = PreferenceConfiguration.FRAME_PACING_MIN_LATENCY;
-        assertTrue((long) start.invoke(renderer) > 0L);
-        assertEquals(1, f.tids.length);
-        set(renderer, "stopping", true);
-        assertEquals(0L, start.invoke(renderer));
     }
 
     @Test
@@ -338,6 +346,117 @@ public class AdpfSubmissionSessionTest {
         verify(platform, times(1)).close();
     }
 
+    @Test
+    public void selectExtraTidsUnifiedReturnsAllPositiveSortedUniqueTids() {
+        assertArrayEquals(new int[] {42, 50, 60},
+                AdpfSubmissionSession.selectExtraTids(true, false, 60, 42, 50, 0, 42));
+        assertArrayEquals(new int[] {42, 50, 60},
+                AdpfSubmissionSession.selectExtraTids(true, true, 60, 42, 50, 0, 42));
+    }
+
+    @Test
+    public void selectExtraTidsLegacyReturnsOnlyBalancedWorker() {
+        assertArrayEquals(new int[] {42},
+                AdpfSubmissionSession.selectExtraTids(false, true, 42, 50, 60, 70, 80));
+        assertSame(AdpfSubmissionSession.NO_EXTRA_TIDS,
+                AdpfSubmissionSession.selectExtraTids(false, false, 42, 50, 60, 70, 80));
+    }
+
+    @Test
+    public void selectExtraTidsReturnsSharedEmptyInstanceWhenNothingQualifies() {
+        assertSame(AdpfSubmissionSession.NO_EXTRA_TIDS,
+                AdpfSubmissionSession.selectExtraTids(true, true, 0, -1, 0, 0, -5));
+        assertSame(AdpfSubmissionSession.NO_EXTRA_TIDS,
+                AdpfSubmissionSession.selectExtraTids(false, true, 0, 50, 60, 70, 80));
+    }
+
+    @Test
+    public void severalExtraTidsCreateOneNormalizedSession() {
+        FakeFactory f = new FakeFactory();
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {50, 42, 42, 0, -1, 7, 60});
+        assertEquals(1, f.calls);
+        assertArrayEquals(new int[] {7, 42, 50, 60}, f.tids);
+        assertTrue(s.isActive());
+    }
+
+    @Test
+    @Config(sdk = 34)
+    public void sameExtraArrayReferenceSkipsAllWork() {
+        FakeFactory f = new FakeFactory();
+        AdpfSubmissionSession s = session(f);
+        int[] extras = {42, 50};
+        for (int i = 0; i < 100; i++) {
+            s.ensureConfigured(7, extras);
+        }
+        assertEquals(1, f.calls);
+        assertEquals(0, f.latest().updates);
+    }
+
+    @Test
+    @Config(sdk = 34)
+    public void equalExtraContentInNewArrayDoesNotReconfigure() {
+        FakeFactory f = new FakeFactory();
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {42, 50});
+        s.ensureConfigured(7, new int[] {50, 42});
+        assertEquals(1, f.calls);
+        assertEquals(0, f.latest().updates);
+    }
+
+    @Test
+    @Config(sdk = 34)
+    public void api34RemovingThreadUsesSingleSetThreads() {
+        FakeFactory f = new FakeFactory();
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {42, 50});
+        assertEquals(1, f.calls);
+        s.ensureConfigured(7, new int[] {42});
+        assertEquals(1, f.calls);
+        assertEquals(1, f.latest().updates);
+        assertArrayEquals(new int[] {7, 42}, f.latest().updatedTids);
+        assertFalse(f.latest().closed);
+    }
+
+    @Test
+    public void clearExtraThreadsBeforeApi34RecreatesInputOnly() {
+        FakeFactory f = new FakeFactory();
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {42, 50});
+        assertEquals(1, f.calls);
+        s.clearExtraThreads();
+        assertEquals(2, f.calls);
+        assertTrue(f.handles.get(0).closed);
+        assertArrayEquals(new int[] {7}, f.tids);
+        assertTrue(s.isActive());
+        assertEquals(0, f.latest().updates);
+    }
+
+    @Test
+    @Config(sdk = 34)
+    public void clearExtraThreadsOnApi34UsesSetThreads() {
+        FakeFactory f = new FakeFactory();
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {42, 50});
+        s.clearExtraThreads();
+        assertEquals(1, f.calls);
+        assertEquals(1, f.handles.get(0).updates);
+        assertArrayEquals(new int[] {7}, f.handles.get(0).updatedTids);
+        assertFalse(f.handles.get(0).closed);
+    }
+
+    @Test
+    public void inputTidChangeWithSameExtrasRecreatesBeforeApi34() {
+        FakeFactory f = new FakeFactory();
+        AdpfSubmissionSession s = session(f);
+        s.ensureConfigured(7, new int[] {42});
+        s.ensureConfigured(8, new int[] {42});
+        assertEquals(2, f.calls);
+        assertTrue(f.handles.get(0).closed);
+        assertArrayEquals(new int[] {8, 42}, f.tids);
+        assertTrue(s.isActive());
+    }
+
     private static void set(Object target, String name, Object value) throws Exception {
         Field field = MediaCodecDecoderRenderer.class.getDeclaredField(name);
         field.setAccessible(true);
@@ -351,6 +470,7 @@ public class AdpfSubmissionSessionTest {
         boolean unsupported;
         boolean rejectAll;
         boolean rejectWorker;
+        boolean nullForExtras;
         boolean rejectPreferred;
         final List<FakeHandle> handles = new ArrayList<>();
 
@@ -366,7 +486,7 @@ public class AdpfSubmissionSessionTest {
             if (rejectAll || (rejectWorker && tids.length > 1)) {
                 throw new IllegalStateException("rejected");
             }
-            if (unsupported) {
+            if (unsupported || (nullForExtras && tids.length > 1)) {
                 return null;
             }
             FakeHandle handle = new FakeHandle();

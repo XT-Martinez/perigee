@@ -30,6 +30,12 @@ android {
         buildConfigField "boolean", "BALANCED_SUBTRACT_APP_VSYNC_OFFSET", "false"
         // Opt-in Pixel 9a/Google AV1 submission hints; no change to the default rendering hints.
         buildConfigField "boolean", "ADPF_TWO_THREAD_EXPERIMENT", "true"
+        // One opt-in session for every in-process pipeline thread: submit, MediaCodec_loop,
+        // CodecLooper, codec callback, renderer and choreographer. Pixel 9a traces on
+        // 2026-11-18 showed each earlier policy left half of these on little cores. Build with
+        // -PadpfUnifiedSession=false for the earlier submit + Balanced-worker policy (A/B).
+        buildConfigField "boolean", "ADPF_UNIFIED_SESSION",
+                (!"false".equalsIgnoreCase(project.findProperty("adpfUnifiedSession")?.toString()?.trim())).toString()
         // Isolated 1 ms submission-budget experiment. Pixel 9a captures on 2026-10-01:
         // reported submission mean 0.99 -> 0.82-0.85 ms, but codec queue-to-completion
         // 4.24 -> 4.19-4.33 ms (no demonstrated decoding-latency improvement). Genuine

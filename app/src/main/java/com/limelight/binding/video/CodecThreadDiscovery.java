@@ -8,11 +8,13 @@ import java.util.Map;
 
 /**
  * Before/after discovery ported from artemis-tcl-av1. Only this app's /proc/self/task is read.
- * Exactly one new MediaCodec_loop with a readable positive kernel start-time token is accepted;
- * none, ambiguous or denied reads fall back to input-only hints. No per-frame scans.
+ * For each requested thread name (MediaCodec_loop, CodecLooper), exactly one new thread with that
+ * name and a readable positive kernel start-time token is accepted; none, ambiguous or denied reads
+ * fall back to input-only hints for that name. One task-list read serves all names. No per-frame scans.
  */
 final class CodecThreadDiscovery {
     static final String WORKER_THREAD_NAME = "MediaCodec_loop";
+    static final String CODEC_LOOPER_THREAD_NAME = "CodecLooper";
 
     interface TaskReader {
         /** Keep enumerated TIDs even when their names cannot be read (null value). */
@@ -23,10 +25,16 @@ final class CodecThreadDiscovery {
     static final class WorkerIdentity {
         final int tid;
         final long startTimeTicks;
+        final String name;
 
         WorkerIdentity(int tid, long startTimeTicks) {
+            this(tid, startTimeTicks, WORKER_THREAD_NAME);
+        }
+
+        WorkerIdentity(int tid, long startTimeTicks, String name) {
             this.tid = tid;
             this.startTimeTicks = startTimeTicks;
+            this.name = name;
         }
     }
 
@@ -60,19 +68,51 @@ final class CodecThreadDiscovery {
     }
 
     WorkerIdentity finishCapture() {
+        return finishCapture(WORKER_THREAD_NAME)[0];
+    }
+
+    /**
+     * Ends the capture and returns one entry per requested name, in the same order.
+     * An entry is non-null only when exactly one NEW thread (absent from the before-snapshot)
+     * has that exact name, its tid is positive, and its start-time token is positive.
+     * None, ambiguous or unverifiable -> that entry is null; other names are unaffected.
+     * Never returns null and never throws: without a usable before-snapshot, with an unreadable
+     * after-snapshot, or on any reader exception, the affected entries are null.
+     * Reads the task list once for all names.
+     */
+    WorkerIdentity[] finishCapture(String... names) {
         Map<Integer, String> before = beforeSnapshot;
         beforeSnapshot = null;
+        if (names == null) {
+            return new WorkerIdentity[0];
+        }
+        WorkerIdentity[] out = new WorkerIdentity[names.length];
         if (before == null) {
+            return out;
+        }
+        Map<Integer, String> after;
+        try {
+            after = reader.readTaskNames();
+        } catch (Throwable t) {
+            return out;
+        }
+        if (after == null) {
+            return out;
+        }
+        for (int i = 0; i < names.length; i++) {
+            out[i] = findNewThread(before, after, names[i]);
+        }
+        return out;
+    }
+
+    private WorkerIdentity findNewThread(Map<Integer, String> before, Map<Integer, String> after, String name) {
+        if (name == null) {
             return null;
         }
         try {
-            Map<Integer, String> after = reader.readTaskNames();
-            if (after == null) {
-                return null;
-            }
             int candidate = 0;
             for (Map.Entry<Integer, String> entry : after.entrySet()) {
-                if (!before.containsKey(entry.getKey()) && WORKER_THREAD_NAME.equals(entry.getValue())) {
+                if (!before.containsKey(entry.getKey()) && name.equals(entry.getValue())) {
                     if (candidate != 0 || entry.getKey() <= 0) {
                         return null;
                     }
@@ -83,19 +123,19 @@ final class CodecThreadDiscovery {
                 return null;
             }
             long start = reader.readStartTimeTicks(candidate);
-            return start > 0 ? new WorkerIdentity(candidate, start) : null;
+            return start > 0 ? new WorkerIdentity(candidate, start, name) : null;
         } catch (Throwable t) {
             return null;
         }
     }
 
     boolean isStillValid(WorkerIdentity identity) {
-        if (identity == null || identity.tid <= 0 || identity.startTimeTicks <= 0) {
+        if (identity == null || identity.name == null || identity.tid <= 0 || identity.startTimeTicks <= 0) {
             return false;
         }
         try {
             Map<Integer, String> now = reader.readTaskNames();
-            return now != null && WORKER_THREAD_NAME.equals(now.get(identity.tid))
+            return now != null && identity.name.equals(now.get(identity.tid))
                     && reader.readStartTimeTicks(identity.tid) == identity.startTimeTicks;
         } catch (Throwable t) {
             return false;

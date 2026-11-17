@@ -12,10 +12,11 @@ import java.util.Locale;
 
 /**
  * Opt-in submission hints ported from artemis-tcl-av1, independent of Artemide's rendering hints.
+ * One session covers the submitting thread plus optional extra pipeline threads chosen by the
+ * caller (codec-owned workers, codec callback, renderer and choreographer threads).
  * One work cycle is elapsed input acquisition, frame copy, queueInputBuffer and prefetch, not
  * external codec-service/hardware latency, network receive, stats formatting or vsync pacing.
- * The app-owned MediaCodec_loop worker participates in the synchronous input handoff and may
- * share that cycle in Balanced mode. Never add external service threads or unrelated callbacks.
+ * Never add external service threads or unrelated callbacks.
  *
  * The build-configured target is an experimental submission budget, not a proven optimum.
  * Artemide's async 2 ms baseline reports mean 0.99 ms / p95 1.93 ms, with only 4% overruns;
@@ -31,6 +32,8 @@ final class AdpfSubmissionSession {
     static final long DEFAULT_TARGET_NS = 2_000_000L;
     static final long TARGET_NS = validateTargetNs(BuildConfig.ADPF_SUBMIT_TARGET_NS);
     static final long MAX_WORK_NS = 1_000_000_000L;
+    /** Shared empty array meaning "no extra threads". */
+    static final int[] NO_EXTRA_TIDS = new int[0];
 
     interface SessionHandle {
         void reportActualWorkDuration(long actualNs);
@@ -47,8 +50,9 @@ final class AdpfSubmissionSession {
     private final long targetNs;
     private SessionHandle session;
     private int inputTid;
-    private CodecThreadDiscovery.WorkerIdentity worker;
-    private CodecThreadDiscovery.WorkerIdentity rejectedWorker;
+    private int[] members;          // Sorted, includes inputTid; null without a session.
+    private int[] rejected;         // Member list the platform refused, or null.
+    private int[] lastExtraTidsRef; // Caller array of the last accepted configuration.
     private volatile boolean disabled;
 
     AdpfSubmissionSession(SessionFactory factory, long targetNs) {
@@ -113,53 +117,51 @@ final class AdpfSubmissionSession {
         return buildEnabled && balanced;
     }
 
-    synchronized void ensureConfigured(int tid, CodecThreadDiscovery.WorkerIdentity desiredWorker) {
+    /**
+     * Pure helper: which extra threads belong in the session. Unified selection takes every
+     * positive tid; the legacy policy takes only the worker, and only in Balanced mode.
+     */
+    static int[] selectExtraTids(boolean unified, boolean balanced, int worker, int codecLooper,
+                                 int callback, int renderer, int choreographer) {
+        int[] candidates = unified
+                ? new int[] { worker, codecLooper, callback, renderer, choreographer }
+                : balanced ? new int[] { worker } : NO_EXTRA_TIDS;
+        int[] tids = new int[candidates.length];
+        int count = 0;
+        for (int tid : candidates) {
+            if (tid > 0) {
+                tids[count++] = tid;
+            }
+        }
+        return count == 0 ? NO_EXTRA_TIDS : sortedUnique(tids, count);
+    }
+
+    /** Hot path, called once per frame by the submitting thread. extraTids is caller-owned and immutable. */
+    synchronized void ensureConfigured(int tid, int[] extraTids) {
         if (disabled || tid <= 0) {
             return;
         }
-        if (desiredWorker == null) {
-            rejectedWorker = null;
-        } else if (desiredWorker.tid <= 0 || desiredWorker.startTimeTicks <= 0
-                || desiredWorker.tid == tid || sameWorker(desiredWorker, rejectedWorker)) {
-            desiredWorker = null;
+        if (extraTids == null) {
+            extraTids = NO_EXTRA_TIDS;
         }
-        if (session != null && inputTid == tid && sameWorker(worker, desiredWorker)) {
-            return; // No allocation, /proc reads or binder updates in the steady-state path.
+        if (session != null && tid == inputTid && extraTids == lastExtraTidsRef) {
+            return; // No allocation, binder call or logging in the steady-state path.
         }
-
-        if (session != null && desiredWorker != null
-                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            try {
-                session.setThreads(threadIds(tid, desiredWorker));
-                inputTid = tid;
-                worker = desiredWorker;
-                return;
-            } catch (Throwable t) {
-                LimeLog.warning("ADPF submission: worker update rejected; input-only: " + t);
-                rejectedWorker = desiredWorker;
-                desiredWorker = null;
-            }
+        int[] desired = desiredMembers(tid, extraTids);
+        if (desired.length == 1) {
+            rejected = null; // The caller dropped its extras; let a later set try again.
+        } else if (Arrays.equals(desired, rejected)) {
+            desired = new int[] { tid };
         }
-        closeSession();
-        if (tryCreate(tid, desiredWorker) || disabled) {
-            return;
-        }
-        if (desiredWorker != null) {
-            rejectedWorker = desiredWorker;
-            LimeLog.warning("ADPF submission: worker rejected; input-only until identity changes");
-            if (tryCreate(tid, null) || disabled) {
-                return;
-            }
-        }
-        disabled = true;
+        apply(tid, desired, extraTids);
     }
 
-    /** Remove worker membership before a recovery can destroy or replace that thread. */
-    synchronized void clearWorker() {
-        if (session != null && worker != null) {
-            ensureConfigured(inputTid, null);
-        } else {
-            rejectedWorker = null;
+    /** Make the session input-only now, before extra threads exit, and forget any rejection. */
+    synchronized void clearExtraThreads() {
+        rejected = null;
+        lastExtraTidsRef = NO_EXTRA_TIDS;
+        if (!disabled && session != null && members != null && members.length > 1) {
+            apply(inputTid, new int[] { inputTid }, NO_EXTRA_TIDS);
         }
     }
 
@@ -189,22 +191,66 @@ final class AdpfSubmissionSession {
         disabled = true; // A late input callback must never resurrect a stopped session.
         closeSession();
         inputTid = 0;
-        worker = null;
-        rejectedWorker = null;
+        rejected = null;
+        lastExtraTidsRef = NO_EXTRA_TIDS;
     }
 
-    private boolean tryCreate(int tid, CodecThreadDiscovery.WorkerIdentity desiredWorker) {
+    /** Applies a desired member list: update in place on API 34+, otherwise recreate. */
+    private void apply(int tid, int[] desired, int[] extraTids) {
+        if (session != null && Arrays.equals(desired, members)) {
+            inputTid = tid;
+            lastExtraTidsRef = extraTids;
+            return;
+        }
+        if (session != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
+                session.setThreads(desired);
+                inputTid = tid;
+                members = desired;
+                lastExtraTidsRef = extraTids;
+                return;
+            } catch (Throwable t) {
+                LimeLog.warning("ADPF submission: thread update rejected; input-only: " + t);
+                if (desired.length > 1) {
+                    rejected = desired;
+                    desired = new int[] { tid };
+                }
+            }
+        }
+        closeSession();
+        recreate(tid, desired);
+        if (session != null) {
+            lastExtraTidsRef = extraTids;
+        }
+    }
+
+    private void recreate(int tid, int[] desired) {
+        if (tryCreate(tid, desired)) {
+            return;
+        }
+        if (desired.length > 1) {
+            rejected = desired;
+            LimeLog.warning("ADPF submission: thread set rejected; input-only until cleared");
+            if (tryCreate(tid, new int[] { tid })) {
+                return;
+            }
+        }
+        disabled = true;
+    }
+
+    private boolean tryCreate(int tid, int[] tids) {
         SessionHandle created = null;
         try {
-            int[] tids = threadIds(tid, desiredWorker);
             created = factory.create(tids, targetNs);
             if (created == null) {
-                disabled = true; // The documented unsupported power-HAL response.
+                // Unsupported power HAL, or a tid the platform does not accept. The caller
+                // latches only after the input-only attempt has failed too.
+                session = null;
                 return false;
             }
             session = created;
             inputTid = tid;
-            worker = desiredWorker;
+            members = tids;
             return true;
         } catch (Throwable t) {
             LimeLog.warning("ADPF submission: creation failed: " + t);
@@ -221,23 +267,35 @@ final class AdpfSubmissionSession {
             try { session.close(); } catch (Throwable ignored) { }
             session = null;
         }
-        worker = null;
+        members = null;
     }
 
     static long validateTargetNs(int configuredNs) {
         return configuredNs > 0 ? configuredNs : DEFAULT_TARGET_NS;
     }
 
-    private static boolean sameWorker(CodecThreadDiscovery.WorkerIdentity a,
-                                      CodecThreadDiscovery.WorkerIdentity b) {
-        return a == b || (a != null && b != null && a.tid == b.tid
-                && a.startTimeTicks == b.startTimeTicks);
+    /** The input tid plus every other positive extra, sorted and without duplicates. */
+    private static int[] desiredMembers(int tid, int[] extraTids) {
+        int[] result = new int[extraTids.length + 1];
+        result[0] = tid;
+        int count = 1;
+        for (int extra : extraTids) {
+            if (extra > 0 && extra != tid) {
+                result[count++] = extra;
+            }
+        }
+        return sortedUnique(result, count);
     }
 
-    private static int[] threadIds(int tid, CodecThreadDiscovery.WorkerIdentity worker) {
-        int[] tids = worker == null ? new int[] { tid } : new int[] { tid, worker.tid };
-        Arrays.sort(tids);
-        return tids;
+    /** Sorts the first count values and drops duplicates. May return the same array. */
+    private static int[] sortedUnique(int[] values, int count) {
+        Arrays.sort(values, 0, count);
+        int unique = count == 0 ? 0 : 1;
+        for (int i = 1; i < count; i++) {
+            if (values[i] != values[unique - 1]) {
+                values[unique++] = values[i];
+            }
+        }
+        return unique == values.length ? values : Arrays.copyOf(values, unique);
     }
-
 }

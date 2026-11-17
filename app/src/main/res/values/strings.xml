@@ -879,6 +879,6 @@
         <item>prime_little</item>
     </string-array>
 
-    <string name="title_checkbox_adpf_hint">ADPF submission hints (Experimental)</string>
-    <string name="summary_checkbox_adpf_hint">Pixel 9a with Google AV1 only. Replaces the default rendering hints with measured app-side submission hints and, in Balanced mode, the app-owned codec worker. Off keeps the default hints. Applies next stream start. No guaranteed latency gain; external decoder-service threads cannot be hinted.</string>
+    <string name="title_checkbox_adpf_hint">ADPF unified pipeline hints (Experimental)</string>
+    <string name="summary_checkbox_adpf_hint">Pixel 9a with Google AV1 only. Replaces the default rendering hints with one session for every app-side video thread (submission, codec worker and looper, codec callback, renderer, choreographer), driven by measured submission time. Off keeps the default hints. Applies next stream start. No guaranteed latency gain; external decoder-service threads cannot be hinted.</string>
 </resources>

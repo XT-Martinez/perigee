@@ -1137,10 +1137,15 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         MediaCodecHelper.applyFrameworkLowLatencyPostStart(videoDecoder);
         // stop/reset can reuse the codec object but replace its worker. Revalidate only on
         // recovery, never per frame; fresh creation resolves the active before/after capture.
-        if (adpfThreadDiscovery != null && !adpfThreadDiscovery.isCapturing()
-                && !adpfThreadDiscovery.isStillValid(adpfWorkerIdentity)) {
-            adpfWorkerIdentity = null;
+        if (adpfThreadDiscovery != null && !adpfThreadDiscovery.isCapturing()) {
+            if (!adpfThreadDiscovery.isStillValid(adpfWorkerIdentity)) {
+                adpfWorkerIdentity = null;
+            }
+            if (!adpfThreadDiscovery.isStillValid(adpfCodecLooperIdentity)) {
+                adpfCodecLooperIdentity = null;
+            }
         }
+        refreshAdpfExtraTids();
 // Diagnostics: dump negotiated input/output formats and check vendor keys acceptance
         try {
             MediaFormat __inF = videoDecoder.getInputFormat();
@@ -1161,6 +1166,7 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         boolean configured = false;
         final CodecThreadDiscovery discovery = adpfThreadDiscovery;
         adpfWorkerIdentity = null;
+        adpfCodecLooperIdentity = null;
         if (discovery != null) {
             discovery.beginCapture();
         }
@@ -1194,14 +1200,23 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             }
             if (discovery != null) {
                 if (configured) {
-                    adpfWorkerIdentity = discovery.finishCapture();
+                    final CodecThreadDiscovery.WorkerIdentity[] found = discovery.finishCapture(
+                            CodecThreadDiscovery.WORKER_THREAD_NAME,
+                            CodecThreadDiscovery.CODEC_LOOPER_THREAD_NAME);
+                    adpfWorkerIdentity = found[0];
+                    // The legacy two-thread policy never hints the codec looper.
+                    adpfCodecLooperIdentity = BuildConfig.ADPF_UNIFIED_SESSION ? found[1] : null;
                     LimeLog.info("ADPF submission: worker discovery " + (adpfWorkerIdentity != null
                             ? "tid=" + adpfWorkerIdentity.tid
-                            : "none/ambiguous/unverifiable; input-only"));
+                            : "none/ambiguous/unverifiable")
+                            + ", codec looper " + (adpfCodecLooperIdentity != null
+                            ? "tid=" + adpfCodecLooperIdentity.tid
+                            : "none"));
                 } else {
                     discovery.cancelCapture();
                 }
             }
+            refreshAdpfExtraTids();
         }
         return configured;
     }
@@ -1285,9 +1300,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                 adpfHintSession.close();
             }
             adpfSubmissionSession = AdpfSubmissionSession.create(context);
-            if (adpfSubmissionSession != null && AdpfSubmissionSession.shouldUseWorkerThread(
+            LimeLog.info("ADPF submission: policy "
+                    + (BuildConfig.ADPF_UNIFIED_SESSION ? "unified" : "legacy submit+worker"));
+            // The unified session needs the codec-owned threads in every pacing mode; the
+            // legacy policy only adds the worker in Balanced.
+            if (adpfSubmissionSession != null && (BuildConfig.ADPF_UNIFIED_SESSION
+                    || AdpfSubmissionSession.shouldUseWorkerThread(
                     BuildConfig.ADPF_TWO_THREAD_EXPERIMENT,
-                    prefs.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED)) {
+                    prefs.framePacing == PreferenceConfiguration.FRAME_PACING_BALANCED))) {
                 adpfThreadDiscovery = new CodecThreadDiscovery(CodecThreadDiscovery.procReader());
             }
         }
@@ -1485,8 +1505,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             // This is the final thread to quiesce, so let's perform the codec recovery now.
             if (codecRecoveryThreadQuiescedFlags == CR_FLAG_ALL) {
                 adpfCodecGeneration++;
-                if (adpfSubmissionSession != null) {
-                    adpfSubmissionSession.clearWorker();
+                final AdpfSubmissionSession submissionHints = adpfSubmissionSession;
+                if (submissionHints != null) {
+                    // Recovery can replace the codec-owned and callback threads. Go input-only
+                    // now; the snapshot is rebuilt once the pipeline is back up.
+                    synchronized (submissionHints) {
+                        adpfExtraTids = AdpfSubmissionSession.NO_EXTRA_TIDS;
+                        submissionHints.clearExtraThreads();
+                    }
                 }
                 // Input and output buffers are invalidated by stop() and reset().
                 nextInputBuffer = null;
@@ -1625,6 +1651,9 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
                         throw new RendererException(this, e);
                     }
                 }
+
+                // Every recovery type ends here; a plain flush has no other refresh point.
+                refreshAdpfExtraTids();
 
                 // Wake all quiesced threads and allow them to begin work again
                 codecRecoveryThreadQuiescedFlags = 0;
@@ -2487,6 +2516,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             adpfSubmissionSession.close();
         }
         adpfWorkerIdentity = null;
+        adpfCodecLooperIdentity = null;
+        adpfExtraTids = AdpfSubmissionSession.NO_EXTRA_TIDS;
 
         // Halt the rendering thread
         if (rendererThread != null) {
@@ -2874,6 +2905,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
             adpfSubmissionSession.close();
         }
         adpfWorkerIdentity = null;
+        adpfCodecLooperIdentity = null;
+        adpfExtraTids = AdpfSubmissionSession.NO_EXTRA_TIDS;
 
         // Clear decode latency tracking to prevent memory leaks
         decodeLatencyTracker.clear();
@@ -3529,10 +3562,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         if (stopping || hint == null || hint.isDisabled()) {
             return 0L;
         }
-        final CodecThreadDiscovery.WorkerIdentity worker =
-                getEffectivePacingForThreadPriorities() == PreferenceConfiguration.FRAME_PACING_BALANCED
-                        ? adpfWorkerIdentity : null;
-        hint.ensureConfigured(Process.myTid(), worker);
+        // The snapshot only changes on lifecycle events, so this is a reference compare per frame.
+        hint.ensureConfigured(Process.myTid(), adpfExtraTids);
         return hint.isActive() ? System.nanoTime() : 0L;
     }
 
@@ -3930,6 +3961,8 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
 
     private void detachAsyncCodec() {
         asyncCodec.detach(videoDecoder, asyncOutputRelease);
+        // The callback thread is gone; drop it from the hint snapshot.
+        refreshAdpfExtraTids();
     }
 
     public boolean isAsyncDecodingActive() {
@@ -4156,6 +4189,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
     private AdpfSubmissionSession adpfSubmissionSession;
     private CodecThreadDiscovery adpfThreadDiscovery;
     private volatile CodecThreadDiscovery.WorkerIdentity adpfWorkerIdentity;
+    /** The current codec's CodecLooper thread; only used by the unified session. */
+    private volatile CodecThreadDiscovery.WorkerIdentity adpfCodecLooperIdentity;
+    /**
+     * Extra members of the submission session besides the submitting thread. Replaced as a
+     * whole by {@link #refreshAdpfExtraTids()}, never mutated, so the per-frame path can
+     * compare references.
+     */
+    private volatile int[] adpfExtraTids = AdpfSubmissionSession.NO_EXTRA_TIDS;
     private volatile long adpfCodecGeneration;
 
     /**
@@ -4241,8 +4282,14 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
      * where the full thread set is known and where every lifecycle/settings change lands.
      */
     private void applyAdpfHint() {
+        if (submissionHintsSelected) {
+            // The submission session owns the pipeline threads; the default session stays closed.
+            refreshAdpfExtraTids();
+            return;
+        }
+
         final AdpfHintSession hint = adpfHintSession;
-        if (hint == null || submissionHintsSelected || stopping) {
+        if (hint == null || stopping) {
             return;
         }
 
@@ -4270,6 +4317,41 @@ public class MediaCodecDecoderRenderer extends VideoDecoderRenderer implements C
         }
 
         hint.configure(new int[] { rendererId, cbId, choreoId }, adpfTargetWorkDurationNs());
+    }
+
+    /**
+     * Rebuilds the extra members of the submission session from the threads that exist now:
+     * the codec-owned worker and looper, the codec callback thread, the renderer and (Balanced
+     * only) the choreographer. Runs on lifecycle events; the submitting thread applies the
+     * result on its next frame. With the legacy policy only the Balanced worker is kept.
+     */
+    private void refreshAdpfExtraTids() {
+        final AdpfSubmissionSession hint = adpfSubmissionSession;
+        if (hint == null || hint.isDisabled()) {
+            return;
+        }
+
+        // The session monitor also serializes concurrent refreshes from different threads.
+        synchronized (hint) {
+            final CodecThreadDiscovery.WorkerIdentity worker = adpfWorkerIdentity;
+            final CodecThreadDiscovery.WorkerIdentity looper = adpfCodecLooperIdentity;
+            final int[] next = AdpfSubmissionSession.selectExtraTids(
+                    BuildConfig.ADPF_UNIFIED_SESSION,
+                    getEffectivePacingForThreadPriorities() == PreferenceConfiguration.FRAME_PACING_BALANCED,
+                    worker != null ? worker.tid : 0,
+                    looper != null ? looper.tid : 0,
+                    liveThreadId(asyncCodec.getCallbackThread()),
+                    rendererTid,
+                    liveThreadId(choreographerHandlerThread));
+            if (!Arrays.equals(next, adpfExtraTids)) {
+                adpfExtraTids = next;
+            }
+        }
+    }
+
+    /** The thread's tid, or 0 when it is absent, finished or has not published its tid yet. */
+    private static int liveThreadId(HandlerThread thread) {
+        return (thread != null && thread.isAlive()) ? thread.getThreadId() : 0;
     }
 
     private void applyVideoThreadPriorities() {
